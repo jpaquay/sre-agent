@@ -39,3 +39,21 @@ resource "google_compute_subnetwork" "subnet" {
     ip_cidr_range = "10.52.0.0/20"
   }
 }
+
+resource "google_compute_router" "router" {
+  count   = var.deploy_infrastructure ? 1 : 0
+  name    = "sre-agent-router"
+  project = var.gcp_project_id
+  region  = var.gcp_region
+  network = google_compute_network.vpc[0].id
+}
+
+resource "google_compute_router_nat" "nat" {
+  count                              = var.deploy_infrastructure ? 1 : 0
+  name                               = "sre-agent-nat"
+  project                            = var.gcp_project_id
+  router                             = google_compute_router.router[0].name
+  region                             = var.gcp_region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}

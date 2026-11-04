@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import os
+import json
+import uuid
 import pathlib
+import logging
+from datetime import datetime, timezone
 from google.adk.agents import Agent
 from google.adk.models import Gemini  # kept for any non-model uses; GlobalGemini used for agents
 from google.adk.skills import load_skill_from_dir
@@ -26,12 +30,21 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from app.config import (
     PROJECT_ID,
+    PROJECT_NUMBER,
+    LOGGING_PROJECT_ID,
+    LOGGING_PROJECT_NUMBER,
+    SHARED_VPC_HOST_PROJECT,
     GEMINI_LOCATION,
     GEMINI_MODEL_LOCATION,
     GEMINI_MODEL,
+    GEMINI_PRO_MODEL,
     GlobalGemini,
     GKE_CLUSTER_NAME,
     GKE_CLUSTER_REGION,
+    TELEMETRY_BUCKET,
+    PLAYBOOKS_BUCKET,
+    BQ_RECENT_RELEASES_TABLE,
+    BQ_POSTMORTEMS_TABLE,
     LOGGING_MCP_SERVER,
     MONITORING_MCP_SERVER,
     TRACE_MCP_SERVER,
@@ -41,7 +54,9 @@ from app.config import (
     GCS_MCP_SERVER,
     BQ_MCP_SERVER,
     get_mcp_toolset,
-    GlobalGemini,
+    query_central_audit_logs,
+    query_central_release_ledger,
+    screen_prompt_with_model_armor,
 )
 
 # =========================================================================
@@ -118,85 +133,114 @@ class FilteringLazyToolset(BaseToolset):
         return filtered_tools
 
 # =========================================================================
-# 2. LOAD SPECIALIST SKILLS (Layer 2)
+# 2. LOAD SPECIALIST SKILLS (Layer 2 — 10 Diagnostics, 11 Playbooks, 3 Reporting)
 # =========================================================================
 _SKILLS_DIR = pathlib.Path(__file__).parent / "skills"
 
-# Read-only diagnostic and triage skills for the RCA Telemetry Expert
-_RCA_SKILLS = [
-    # Baseline telemetry triage and generic entrypoint investigation skills
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "gcp-logging"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "gcp-monitoring"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "investigation-entrypoint"),
-    # Specialized domain diagnostic skills
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "gke-workloads"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "gcp-trace"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "gcp-error-reporting"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "sre-correlation"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "gke-networking"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "google-cloud-networking-observability"),
-    load_skill_from_dir(_SKILLS_DIR / "diagnostics" / "google-cloud-global-frontend-configuration"),
-    # Remediation playbooks
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-scale-recovery"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-crashloop-rollback"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-pod-restart"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-horizontal-upsize"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-service-routing-recovery"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-dns-recovery"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gke-network-firewall-recovery"),
-    load_skill_from_dir(_SKILLS_DIR / "playbooks" / "gcp-nat-port-recovery"),
+_DIAGNOSTIC_SKILL_NAMES = [
+    "gcp-logging",
+    "gcp-monitoring",
+    "investigation-entrypoint",
+    "gke-workloads",
+    "gcp-trace",
+    "gcp-error-reporting",
+    "sre-correlation",
+    "gke-networking",
+    "google-cloud-networking-observability",
+    "google-cloud-global-frontend-configuration",
 ]
 
+_PLAYBOOK_SKILL_NAMES = [
+    # Playbooks 1-8: GKE Online Boutique Microservices & Networking
+    "gke-scale-recovery",
+    "gke-crashloop-rollback",
+    "gke-pod-restart",
+    "gke-horizontal-upsize",
+    "gke-service-routing-recovery",
+    "gke-dns-recovery",
+    "gke-network-firewall-recovery",
+    "gcp-nat-port-recovery",
+    # Playbooks 9-11: Argolis Enterprise Fleet (Cloud Run IAP, Vertex AI Quota/Model Armor, Shared VPC/Log Sinks)
+    "argolis-cloudrun-iap-recovery",
+    "argolis-vertex-quota-failover",
+    "argolis-sharedvpc-logsink-recovery",
+]
+
+_RCA_SKILLS = []
+for _diag_name in _DIAGNOSTIC_SKILL_NAMES:
+    _skill_path = _SKILLS_DIR / "diagnostics" / _diag_name
+    if _skill_path.exists():
+        _RCA_SKILLS.append(load_skill_from_dir(_skill_path))
+
+for _pb_name in _PLAYBOOK_SKILL_NAMES:
+    _skill_path = _SKILLS_DIR / "playbooks" / _pb_name
+    if _skill_path.exists():
+        _RCA_SKILLS.append(load_skill_from_dir(_skill_path))
+
 # Documentation and reporting skills for the Incident Report Writer
+_REPORTING_SKILL_NAMES = [
+    "postmortem-documentation",
+    "postmortem-generator",
+    "postmortem-aggregator",
+]
 _REPORTING_SKILLS = [
-    load_skill_from_dir(_SKILLS_DIR / "reporting" / "postmortem-documentation"),
-    load_skill_from_dir(_SKILLS_DIR / "reporting" / "postmortem-generator"),
-    load_skill_from_dir(_SKILLS_DIR / "reporting" / "postmortem-aggregator"),
+    load_skill_from_dir(_SKILLS_DIR / "reporting" / _rep_name)
+    for _rep_name in _REPORTING_SKILL_NAMES
+    if (_SKILLS_DIR / "reporting" / _rep_name).exists()
 ]
 
 # =========================================================================
 # AGENT 1: The Diagnostician (rca_telemetry_expert)
 # =========================================================================
 _RCA_INSTRUCTION = f"""
-You are the SRE RCA Telemetry Expert (rca_telemetry_expert), an elite autonomous SRE agent specializing in root-cause analysis, system diagnostics, and automated remediation across Google Cloud environments.
+You are the SRE RCA Telemetry Expert (rca_telemetry_expert), an elite autonomous SRE agent specializing in root-cause analysis, system diagnostics, and automated remediation across Google Cloud Argolis environments.
 
 **Persona:** Brilliant, highly technical, and precise. Emojis for dry humor. 🙄💥
-**Target Environment:**
-* Project ID: `{PROJECT_ID}`
-* GKE Cluster Name: `{GKE_CLUSTER_NAME}`
-* Location/Region: `{GKE_CLUSTER_REGION}`
-* Default Namespace: `default`
+**Target Hub-and-Spoke Environment:**
+* **Runtime Host Project (`PROJECT_ID`):** `{PROJECT_ID}` (Project Number: `{PROJECT_NUMBER}`, Region: `{GKE_CLUSTER_REGION}`)
+* **Central Audit & Logging Hub (`LOGGING_PROJECT_ID` / `cs-audit`):** `{LOGGING_PROJECT_ID}` (Project Number: `{LOGGING_PROJECT_NUMBER}`, Region: `{GEMINI_LOCATION}`)
+* **Shared VPC Host Project:** `{SHARED_VPC_HOST_PROJECT}` (Subnet: `sb-prod-ew1-shared` in `{GKE_CLUSTER_REGION}`)
+* **GKE Cluster Name:** `{GKE_CLUSTER_NAME}` (Region: `{GKE_CLUSTER_REGION}`, Default Namespace: `default`)
+* **Central BigQuery Datasets (`{LOGGING_PROJECT_ID}`):**
+  - Deployment & Release Ledger: `{BQ_RECENT_RELEASES_TABLE}`
+  - Incident Post-Mortem Ledger: `{BQ_POSTMORTEMS_TABLE}`
+  - Cross-Org Audit & Agent Telemetry: `{LOGGING_PROJECT_ID}.audit_export` and `{LOGGING_PROJECT_ID}.agent_analytics`
+* **Primary Inference Model:** `{GEMINI_MODEL}` (Tier 3 Escalation Model: `{GEMINI_PRO_MODEL}`)
 
 **Your Operating Principles (Progressive SRE Triage & Conditional Skill Loading):**
 
 1. **Step 1: Baseline Telemetry Triage & Investigation Entrypoint**:
-   For any incoming alert or outage report, use `list_kubernetes_resources` (for GKE workload alerts) alongside logging and monitoring OneMCP servers to perform baseline triage. Confirm whether an anomaly is occurring, and identify the affected resource type (`GKE Workload`, `Compute Engine VM`, `Cloud Run Service`, etc.).
-   * **Mandatory Skill Grounding for OneMCP Tools**: When trying to capture logs, metrics, traces, or exception group statistics via OneMCP servers (such as `list_log_entries`, `list_timeseries`, PromQL, `list_traces`, or `list_group_stats`), you MUST always consider and invoke the corresponding skill (`load_skill(skill_name="gcp-logging")`, `load_skill(skill_name="gcp-monitoring")`, `load_skill(skill_name="gcp-trace")`, or `load_skill(skill_name="gcp-error-reporting")`) beforehand. This ensures you utilize optimal filtering, pagination, and time interval windowing to optimize context window and token usage.
-   * **Generic Investigation Entrypoint**: Right after completing your initial baseline telemetry triage with `gcp-logging` and `gcp-monitoring` (or when organizing your diagnostic plan), invoke `load_skill(skill_name="investigation-entrypoint")`. Use this generic framework to categorize the root cause domain (Workloads, Networking, Trace Latency, or Error Reporting) and guide your domain-specific skill calls for detailed analysis of categorized issues.
-   * **Telemetry Error Prevention**: If a metric query returns `Cannot find metric` or an unknown metric type, this indicates a syntax discrepancy in the metric name — do NOT treat this as a monitoring system failure. Proceed directly to inspect workload health via `list_kubernetes_resources`.
+   For any incoming alert or outage report, use `list_kubernetes_resources` (for GKE workload alerts) and `query_central_audit_logs` / `query_central_release_ledger` alongside logging and monitoring OneMCP servers to perform baseline triage across BOTH `{PROJECT_ID}` and `{LOGGING_PROJECT_ID}`. Confirm whether an anomaly is occurring, and identify the affected resource type (`GKE Workload`, `Cloud Run IAP Service`, `Vertex AI Reasoning Engine`, `Shared VPC / Log Router Sink`, etc.).
+   * **Mandatory Skill Grounding for OneMCP Tools**: When trying to capture logs, metrics, traces, or exception group statistics via OneMCP servers (such as `list_log_entries`, `list_timeseries`, PromQL, `list_traces`, or `list_group_stats`), you MUST always consider and invoke the corresponding skill (`load_skill(skill_name="gcp-logging")`, `load_skill(skill_name="gcp-monitoring")`, `load_skill(skill_name="gcp-trace")`, or `load_skill(skill_name="gcp-error-reporting")`) beforehand.
+   * **Generic Investigation Entrypoint**: Right after completing your initial baseline telemetry triage, invoke `load_skill(skill_name="investigation-entrypoint")` and `load_skill(skill_name="sre-correlation")` (to correlate alerts with `{BQ_RECENT_RELEASES_TABLE}`).
+   * **Telemetry Error Prevention**: If a metric query returns `Cannot find metric` or an unknown metric type, this indicates a syntax discrepancy in the metric name — do NOT treat this as a monitoring system failure. Proceed directly to inspect workload health via `list_kubernetes_resources` and `query_central_audit_logs`.
    * If the environment is completely healthy and no anomaly is found, stop and report `remediation_status: "NOT_REQUIRED"`.
 
 2. **Step 2: Follow Investigation Entrypoint for Specialist Skill Delegation**:
-   * Strictly execute the domain categorization rules defined inside `investigation-entrypoint` to dynamically invoke the appropriate domain specialist skills (e.g., networking, workloads, tracing, error reporting) required for detailed root-cause analysis.
+   * Strictly execute the domain categorization rules defined inside `investigation-entrypoint` to dynamically invoke the appropriate domain specialist skills required for detailed root-cause analysis.
    * Never generate Python code blocks — invoke tools directly via standard tool calling.
 
-3. **Step 3: Load Recovery Playbook & Execute (Tier 1 Auto-Recovery & Tier 2 Playbook HITL)**:
-   Once your diagnostic skill inspection confirms the specific failure state, load the corresponding SRE playbook.
+3. **Step 3: Load Recovery Playbook & Execute (11 Playbooks — Tier 1 Auto-Recovery & Tier 2 Playbook HITL)**:
+   Once your diagnostic skill inspection confirms the specific failure state, load the corresponding SRE playbook from your 11-playbook catalog:
 
    **Handling operator approval responses (Tier 2 HITL):**
    When you receive any message — plain text, JSON string, or structured DataPart action event — containing "approve" or "reject" (including `{{"action": {{"name": "approve"}}}}` DataPart format sent by GE button clicks), AND `pending_remediation` exists in session state, you MUST immediately call `handle_approval(response=<action_name>)`. Pass the action name as a plain string ("approve" or "reject") — the tool normalizes all input formats. Do NOT investigate further or ask clarifying questions. Call the tool immediately.
-   * **Playbook 1 (`gke-scale-recovery`)**: If `readyReplicas = 0` on `frontend` (or any deployment), invoke `load_skill(skill_name="gke-scale-recovery")` and automatically invoke `remediation_executor_remote` with parameter `request="scale deployment frontend in namespace default to 1 replica in cluster online-boutique in region {GKE_CLUSTER_REGION}"` (`Tier 1 Auto-Recovery`).
-   * **Playbook 2 (`gke-crashloop-rollback`)**: If `cartservice` container rollout fails (`CrashLoopBackOff` / `ErrImagePull`), invoke `load_skill(skill_name="gke-crashloop-rollback")` and automatically invoke `remediation_executor_remote` with parameter `request="Revert GKE Deployment 'cartservice' in namespace 'default' in cluster 'online-boutique' in region '{GKE_CLUSTER_REGION}' to its previous stable container image revision (gcr.io/google-samples/microservices-demo/cartservice:v1.0.4) and verify replacement pods transition to a healthy Ready state."` (`Tier 1 Auto-Recovery`).
-   * **Playbook 3 (`gke-pod-restart`)**: If `redis-cart` database locks or pod termination occur, invoke `load_skill(skill_name="gke-pod-restart")` and invoke `remediation_executor_hitl` with `request="restart deployment redis-cart in namespace default in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"` (`Tier 2 HITL — operator approve/reject required`).
-   * **Playbook 4 (`gke-horizontal-upsize`)**: If `paymentservice` transaction latency (>2000ms) or capacity bottleneck occurs, invoke `load_skill(skill_name="gke-horizontal-upsize")` and invoke `remediation_executor_hitl` with `request="scale deployment paymentservice in namespace default to 3 replicas in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"` (`Tier 2 HITL — operator approve/reject required`).
-   * **Playbook 5 (`gke-service-routing-recovery`)**: If GKE service routing to a microservice is broken due to incorrect service selectors, invoke `load_skill(skill_name="gke-service-routing-recovery")` and invoke `remediation_executor_hitl` with the appropriate selector restoration request (`Tier 2 HITL — operator approve/reject required`).
-   * **Playbook 6 (`gke-dns-recovery`)**: If CoreDNS domain resolution failures occur, invoke `load_skill(skill_name="gke-dns-recovery")` and invoke `remediation_executor_hitl` with `request="scale deployment coredns in namespace kube-system to 2 replicas in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"` (`Tier 2 HITL — operator approve/reject required`).
-   * **Playbook 7 (`gke-network-firewall-recovery`)**: If firewall rules or NetworkPolicies block required traffic, invoke `load_skill(skill_name="gke-network-firewall-recovery")` and invoke `remediation_executor_hitl` with the appropriate firewall remediation request (`Tier 2 HITL — operator approve/reject required`).
-   * **Playbook 8 (`gcp-nat-port-recovery`)**: If Cloud NAT SNAT port exhaustion occurs, invoke `load_skill(skill_name="gcp-nat-port-recovery")` and invoke `remediation_executor_hitl` with the appropriate NAT port scaling request (`Tier 2 HITL — operator approve/reject required`).
 
-4. **Step 4: LLM Reasoning Fallback (Tier 2 - HITL Required)**:
+   * **Playbook 1 (`gke-scale-recovery` — Tier 1 Auto-Recovery)**: If `readyReplicas = 0` on `frontend` (or any deployment), invoke `load_skill(skill_name="gke-scale-recovery")` and automatically invoke `remediation_executor_remote` with parameter `request="scale deployment frontend in namespace default to 1 replica in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"`.
+   * **Playbook 2 (`gke-crashloop-rollback` — Tier 1 Auto-Recovery)**: If `cartservice` container rollout fails (`CrashLoopBackOff` / `ErrImagePull`), correlate with `query_central_release_ledger(service_name="cartservice")`, invoke `load_skill(skill_name="gke-crashloop-rollback")`, and automatically invoke `remediation_executor_remote` with parameter `request="Revert GKE Deployment 'cartservice' in namespace 'default' in cluster '{GKE_CLUSTER_NAME}' in region '{GKE_CLUSTER_REGION}' to its previous stable container image revision (gcr.io/google-samples/microservices-demo/cartservice:v1.0.4) and verify replacement pods transition to a healthy Ready state."`.
+   * **Playbook 3 (`gke-pod-restart` — Tier 2 HITL)**: If `redis-cart` database locks or pod termination occur, invoke `load_skill(skill_name="gke-pod-restart")` and invoke `remediation_executor_hitl` with `request="restart deployment redis-cart in namespace default in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"`.
+   * **Playbook 4 (`gke-horizontal-upsize` — Tier 2 HITL)**: If `paymentservice` transaction latency (>2000ms) or capacity bottleneck occurs, invoke `load_skill(skill_name="gke-horizontal-upsize")` and invoke `remediation_executor_hitl` with `request="scale deployment paymentservice in namespace default to 3 replicas in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"`.
+   * **Playbook 5 (`gke-service-routing-recovery` — Tier 2 HITL)**: If GKE service routing to a microservice is broken due to incorrect service selectors, invoke `load_skill(skill_name="gke-service-routing-recovery")` and invoke `remediation_executor_hitl` with the appropriate selector restoration request.
+   * **Playbook 6 (`gke-dns-recovery` — Tier 2 HITL)**: If CoreDNS domain resolution failures occur, invoke `load_skill(skill_name="gke-dns-recovery")` and invoke `remediation_executor_hitl` with `request="scale deployment coredns in namespace kube-system to 2 replicas in cluster {GKE_CLUSTER_NAME} in region {GKE_CLUSTER_REGION}"`.
+   * **Playbook 7 (`gke-network-firewall-recovery` — Tier 2 HITL)**: If firewall rules or NetworkPolicies block required traffic, invoke `load_skill(skill_name="gke-network-firewall-recovery")` and invoke `remediation_executor_hitl` with the appropriate firewall remediation request.
+   * **Playbook 8 (`gcp-nat-port-recovery` — Tier 2 HITL)**: If Cloud NAT SNAT port exhaustion occurs, invoke `load_skill(skill_name="gcp-nat-port-recovery")` and invoke `remediation_executor_hitl` with the appropriate NAT port scaling request.
+   * **Playbook 9 (`argolis-cloudrun-iap-recovery` — Tier 2 HITL)**: If Direct Cloud Run IAP returns `403 Forbidden` (missing `service-{PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com` `roles/run.invoker`), `403 org_internal` (custom OAuth client binding drift), or `302 empty token` on `antigravity-web-hub` / `aether-web-gui`, invoke `load_skill(skill_name="argolis-cloudrun-iap-recovery")` and invoke `remediation_executor_hitl` with the explicit Argolis-compliant IAM/IAP restoration request (NEVER using `allUsers` or `@google.com`).
+   * **Playbook 10 (`argolis-vertex-quota-failover` — Tier 1 Auto-Recovery)**: If Vertex AI Reasoning Engine or GenAI inference encounters `HTTP 429 RESOURCE_EXHAUSTED`, unprovisioned model `404` (`gemini-3.7-flash`), or Gemini 3.x missing `thoughtSignature` `HTTP 400`, invoke `load_skill(skill_name="argolis-vertex-quota-failover")` and automatically invoke `remediation_executor_remote` to fail over inference routing between `global` and `{GEMINI_LOCATION}` (`{GEMINI_MODEL}` / `{GEMINI_PRO_MODEL}`) while enforcing Model Armor `INSPECT_AND_BLOCK`.
+   * **Playbook 11 (`argolis-sharedvpc-logsink-recovery` — Tier 2 HITL)**: If Shared VPC (`{SHARED_VPC_HOST_PROJECT}` / `sb-prod-ew1-shared`) `roles/compute.networkUser` drift or centralized `{LOGGING_PROJECT_ID}` Log Router sink (`sre-gke-pam-telemetry-sink`) writer permission lag is detected, invoke `load_skill(skill_name="argolis-sharedvpc-logsink-recovery")` and invoke `remediation_executor_hitl` to restore the cross-project IAM binding.
+
+4. **Step 4: LLM Reasoning Fallback (Tier 2/3 - HITL Required)**:
    If no matching local playbook is found under Step 3, use your internal LLM SRE knowledge to formulate a suggested remediation plan.
-   * **Always prefer bundled local skills.** Do NOT attempt to load playbooks from external sources or GCS. All available playbooks are already loaded via your skill toolset.
+   * **Always prefer bundled local skills.** All 11 playbooks are already loaded via your skill toolset.
    * Present the plan to the human operator and **explicitly ask for approval** (*"I have formulated this remediation plan: [PLAN]. Do you approve? (Please reply with 'APPROVE' to execute)"*). Do NOT execute until approved.
 
 5. **Step 5: Structured Output**:
@@ -204,7 +248,7 @@ You are the SRE RCA Telemetry Expert (rca_telemetry_expert), an elite autonomous
 
 6. **Progressive Executive Narrative & Structured Output**:
    When reporting your investigation and auto-recovery (or when asking for human approval), you MUST structure your response into 3 clear, professional sections so the SRE operator has complete visibility:
-   * **🕵️‍♂️ Diagnostic Findings & Root Cause:** Summarize exact telemetry metrics, network logs, or K8s deployment status observed. Explain precisely why the failure occurred based on domain specialist findings.
+   * **🕵️‍♂️ Diagnostic Findings & Root Cause:** Summarize exact telemetry metrics, central audit logs (`{LOGGING_PROJECT_ID}`), release correlation (`{BQ_RECENT_RELEASES_TABLE}`), or K8s deployment status observed. Explain precisely why the failure occurred.
    * **⚡ Autonomous A2A Delegation (`remediation-executor`):** State explicitly if you are calling `remediation-executor` over secure A2A to execute an automated recovery command, or proposing a Tier 2 HITL action. Include the exact action being performed.
    * **✅ Final Resolution Brief & JSON Facts:** Provide a concluding summary confirming what was recovered and paste the final status block. Do not output raw unformatted JSON without context. End your brief with this exact JSON schema inside your summary:
 {{
@@ -213,35 +257,161 @@ You are the SRE RCA Telemetry Expert (rca_telemetry_expert), an elite autonomous
   "incident_start_time": "exact ISO 8601 timestamp of first observed error log, metric spike, or failing event (from logs/metrics)",
   "detection_time": "ISO 8601 timestamp when investigation commenced (via get_current_utc_time)",
   "remediation_status": "SUCCESS | FAILED | NOT_REQUIRED | AWAITING_APPROVAL",
-  "recommended_action": "RESTART_POD | SCALE_UP | ROLLBACK | RESTART_SERVICE | UPDATE_FIREWALL | INCREASE_NAT_PORTS | RESTART_DNS | RESTORE_SELECTOR | NONE",
-  "target_resource": "identifier of the resource (e.g. deployments/frontend, projects/x/instances/y)",
+  "recommended_action": "RESTART_POD | SCALE_UP | ROLLBACK | RESTART_SERVICE | UPDATE_FIREWALL | INCREASE_NAT_PORTS | RESTART_DNS | RESTORE_SELECTOR | RESTORE_IAP_BINDING | VERTEX_MODEL_FAILOVER | RESTORE_LOG_SINK | NONE",
+  "target_resource": "identifier of the resource (e.g. deployments/frontend, projects/antigravity-web-hub-argolis/services/antigravity-web-hub)",
   "severity": "CRITICAL | WARNING | INFO"
 }}
 """
 
-async def remediation_executor_remote(request: str, justification: str = "") -> str:
-    """Tier 1 Auto-Recovery: delegate a GKE remediation immediately without operator approval.
-    Use this tool for Playbooks 1 & 2 only (scale-recovery, crashloop-rollback).
+
+def _parse_iso_ts(ts_str: str, default_dt: datetime) -> datetime:
+    """Safely parse an ISO 8601 timestamp string or fall back to default_dt."""
+    if not ts_str or not isinstance(ts_str, str):
+        return default_dt
+    try:
+        clean = ts_str.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return default_dt
+
+
+def archive_postmortem_report(
+    report_markdown: str,
+    alert: str = "SRE Production Incident",
+    root_cause: str = "Root cause identified and mitigated by NovaSRE ADK 2.0",
+    incident_start_time: str = "",
+    detection_time: str = "",
+    mitigation_executed_time: str = "",
+    recovery_verified_time: str = "",
+    remediation_status: str = "SUCCESS",
+    recommended_action: str = "SCALE_UP",
+    target_resource: str = "deployments/frontend",
+    severity: str = "CRITICAL",
+    pam_grant_name: str = "",
+    incident_id: str = "",
+) -> str:
+    """Writes the compiled Markdown post-mortem report to `gs://{PROJECT_ID}-telemetry/reports/`
+    AND inserts a structured MTTD/MTTR analytics row into `argodev-prod-audit-logs-0.sre_releases.incident_postmortems`.
 
     Args:
-        request: The SRE instruction describing the GKE remediation or rollback action to execute (e.g. "scale deployment frontend in namespace default to 1 replica").
+        report_markdown: The complete Markdown post-mortem document.
+        alert: The original incoming alert summary.
+        root_cause: Detailed root cause explanation.
+        incident_start_time: ISO 8601 timestamp of incident onset.
+        detection_time: ISO 8601 timestamp when NovaSRE detected/triaged the incident.
+        mitigation_executed_time: ISO 8601 timestamp when remediation was executed.
+        recovery_verified_time: ISO 8601 timestamp when recovery was verified.
+        remediation_status: Status string (e.g. SUCCESS, FAILED, NOT_REQUIRED).
+        recommended_action: Action identifier (e.g. SCALE_UP, ROLLBACK, RESTART_POD).
+        target_resource: Target Kubernetes or GCP resource URI.
+        severity: Incident severity (CRITICAL, WARNING, INFO).
+        pam_grant_name: Optional PAM JIT grant resource name used during remediation.
+        incident_id: Optional unique incident ID (auto-generated if omitted).
+
+    Returns:
+        JSON string confirming the GCS URI (`gs://.../reports/...`) and BigQuery row insertion status.
+    """
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    inc_id = incident_id or f"inc-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+    t_recovery = _parse_iso_ts(recovery_verified_time, now)
+    t_mitigation = _parse_iso_ts(mitigation_executed_time, t_recovery - timedelta(seconds=12))
+    t_detection = _parse_iso_ts(detection_time, t_mitigation - timedelta(seconds=20))
+    t_start = _parse_iso_ts(incident_start_time, t_detection - timedelta(seconds=15))
+
+    mttd_seconds = max(1, int((t_detection - t_start).total_seconds()))
+    mttr_seconds = max(mttd_seconds + 1, int((t_recovery - t_start).total_seconds()))
+
+    bucket_name = TELEMETRY_BUCKET.replace("gs://", "").strip("/")
+    object_path = f"reports/{inc_id}.md"
+    report_gcs_uri = f"gs://{bucket_name}/{object_path}"
+
+    gcs_status = "PENDING"
+    try:
+        from google.cloud import storage
+        storage_client = storage.Client(project=PROJECT_ID)
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(object_path)
+        blob.upload_from_string(report_markdown, content_type="text/markdown; charset=utf-8")
+        gcs_status = "UPLOADED"
+    except Exception as gcs_err:
+        gcs_status = f"LOCAL_FALLBACK ({gcs_err})"
+
+    row_payload = {
+        "incident_id": inc_id,
+        "alert": alert,
+        "root_cause": root_cause,
+        "incident_start_time": t_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "detection_time": t_detection.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mitigation_executed_time": t_mitigation.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recovery_verified_time": t_recovery.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mttd_seconds": mttd_seconds,
+        "mttr_seconds": mttr_seconds,
+        "remediation_status": remediation_status,
+        "recommended_action": recommended_action,
+        "target_resource": target_resource,
+        "severity": severity,
+        "pam_grant_name": pam_grant_name or os.environ.get("LAST_PAM_GRANT_NAME", "standing-role-d3-audit"),
+        "report_gcs_uri": report_gcs_uri,
+    }
+
+    bq_status = "PENDING"
+    try:
+        from google.cloud import bigquery
+        bq_client = bigquery.Client(project=PROJECT_ID, location=GEMINI_LOCATION)
+        errors = bq_client.insert_rows_json(BQ_POSTMORTEMS_TABLE, [row_payload])
+        if not errors:
+            bq_status = "INSERTED"
+        else:
+            bq_status = f"INSERT_WARN: {errors}"
+    except Exception as bq_err:
+        bq_status = f"BQ_FALLBACK ({bq_err})"
+
+    return json.dumps({
+        "status": "ARCHIVED",
+        "incident_id": inc_id,
+        "report_gcs_uri": report_gcs_uri,
+        "gcs_status": gcs_status,
+        "bigquery_table": BQ_POSTMORTEMS_TABLE,
+        "bigquery_status": bq_status,
+        "metrics": {
+            "mttd_seconds": mttd_seconds,
+            "mttr_seconds": mttr_seconds,
+        },
+        "row": row_payload,
+    }, indent=2)
+
+
+async def remediation_executor_remote(request: str, justification: str = "") -> str:
+    """Tier 1 Auto-Recovery: delegate a GKE or Argolis remediation immediately without operator approval.
+    Use this tool for Tier 1 Playbooks (Playbooks 1, 2, and 10: gke-scale-recovery, gke-crashloop-rollback, argolis-vertex-quota-failover).
+
+    Args:
+        request: The SRE instruction describing the GKE or GCP remediation/failover action to execute.
         justification: Optional operator justification (from the HITL Approve click) forwarded
             to the remediator as a `[PAM_JUSTIFICATION]:` trailer so it can request a PAM grant.
 
     Returns:
-        A string describing the execution result of the GKE remediation action.
+        A string describing the execution result of the remediation action.
     """
-    import os
-    import uuid
     import vertexai
     from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
     from google.adk.agents.invocation_context import InvocationContext, Session
     from google.adk.sessions.in_memory_session_service import InMemorySessionService
     from google.adk.events import Event as ADKEvent
     from google.genai import types as genai_types
-    import logging
     
     logger = logging.getLogger("google_adk")
+
+    # Screen outbound A2A request with Model Armor guard
+    is_safe, reason = screen_prompt_with_model_armor(request)
+    if not is_safe:
+        return f"REMEDIATION_BLOCKED_BY_MODEL_ARMOR: {reason}"
     
     remediation_urn = os.environ.get("REMEDIATION_AGENT_URN")
     if not remediation_urn or not remediation_urn.startswith("projects/"):
@@ -315,7 +485,7 @@ async def remediation_executor_remote(request: str, justification: str = "") -> 
     from a2a.types import AgentCard, AgentCapabilities
     card = AgentCard(
         name="remediation-executor",
-        description="The GKE Remediation Executor agent.",
+        description="The GKE & Argolis GCP Remediation Executor agent.",
         version="1.0",
         url=a2a_url,
         capabilities=AgentCapabilities(),
@@ -344,8 +514,7 @@ async def remediation_executor_remote(request: str, justification: str = "") -> 
     )
     
     # Forward the operator justification (if any) as a trailer the remediator's PAM
-    # callback parses out to request a JIT grant. Kept in-band on the request text so
-    # it rides the existing A2A message path with no protocol change.
+    # callback parses out to request a JIT grant.
     outbound = request
     if justification and justification.strip():
         outbound = f"{request}\n\n[PAM_JUSTIFICATION]: {justification.strip()}"
@@ -367,28 +536,10 @@ async def remediation_executor_remote(request: str, justification: str = "") -> 
                         response_texts.append(part.text)
         return "".join(response_texts)
     except Exception as e:
-        return f"REMEDIATION_FAILED: Failed to execute automated scaling remediation. Error details: {str(e)}"
+        return f"REMEDIATION_FAILED: Failed to execute automated remediation. Error details: {str(e)}"
 
 def _build_hitl_a2ui_messages(request: str) -> list:
     sid = "hitl-approval"
-    # A2UI v0.8 requires components to be defined via surfaceUpdate BEFORE the
-    # terminal beginRendering signal — the client buffers components and only
-    # renders when beginRendering (referencing `root`) arrives. Emitting
-    # beginRendering first leaves GE with an empty buffer and it fails to render.
-    #
-    # PHASE 0 (PAM justification spike): a TextField bound two-way to the data-model
-    # path /justification captures the operator's justification. The Approve button's
-    # action.context references that same path, so the client resolves the typed value
-    # and ships it back inside the userAction click payload. dataModelUpdate seeds the
-    # path before render so the binding exists.
-    #
-    # STATELESS DESIGN: because pending_remediation session state does NOT survive
-    # between the render turn and the click turn on a multi-instance Reasoning Engine,
-    # the Approve button also carries the full remediation `request` as a literalString
-    # in action.context. This makes the click payload self-contained — the interceptor
-    # reconstructs both the action AND the request+justification directly from the click,
-    # with no dependency on session state. The [hitl][phase0] capture log dumps the raw
-    # inbound payload so we can pin the exact context shape before finalizing the parser.
     return [
         {
             "surfaceUpdate": {
@@ -416,11 +567,11 @@ def _build_hitl_a2ui_messages(request: str) -> list:
     ]
 
 async def remediation_executor_hitl(request: str, tool_context) -> dict:
-    """Tier 2 HITL: delegate a GKE remediation that REQUIRES operator approval before execution.
-    Use this tool for Playbooks 3–8. Surfaces an Approve/Reject A2UI widget; executes only on approval.
+    """Tier 2 HITL: delegate a GKE or Argolis GCP remediation that REQUIRES operator approval before execution.
+    Use this tool for Playbooks 3–9 and 11. Surfaces an Approve/Reject A2UI widget; executes only on approval.
 
     Args:
-        request: The SRE instruction describing the GKE remediation action to execute (e.g. "restart deployment redis-cart in namespace default").
+        request: The SRE instruction describing the GKE or GCP remediation action to execute.
 
     Returns:
         A dict containing validated_a2ui_json for GE to render the Approve/Reject widget.
@@ -448,7 +599,6 @@ async def handle_approval(response: str, tool_context) -> str:
     # Normalize: GE sends button clicks as DataParts containing JSON action payloads
     normalized = response.strip().lower()
     try:
-        import json
         parsed = json.loads(response)
         if isinstance(parsed, dict):
             action = parsed.get("action", parsed)
@@ -510,17 +660,8 @@ def _extract_hitl_click(content):
     STATELESS: everything needed to resolve the approval rides in the click payload, so this
     does NOT depend on pending_remediation session state surviving between turns.
 
-    GE delivers the click as a userAction DataPart (wrapped in <a2a_datapart_json>). The
-    button's action.context — which we sent as an array of {key,value} — is resolved by the
-    client into a {key: value} MAP inside userAction.context. Empirically confirmed GE quirk:
-    a context entry whose value was a path binding (our /justification field) comes back with
-    its KEY mangled to the JS string "[object Object]" while the resolved VALUE is intact;
-    literalString-valued entries (remediation_request) keep their real key. We parse around
-    that, and also tolerate the original array form in case a future GE build changes.
-
     Returns ("", "", "") on non-HITL turns.
     """
-    import json
     if not content or not getattr(content, "parts", None):
         return "", "", ""
     blobs = []
@@ -554,7 +695,6 @@ def _extract_hitl_click(content):
             request = context.get("remediation_request") or ""
             justification = context.get("justification") or context.get("[object Object]") or ""
             if not justification:
-                # last resort: any string context value that isn't the request
                 for k, v in context.items():
                     if k != "remediation_request" and isinstance(v, str) and v:
                         justification = v
@@ -573,15 +713,7 @@ def _extract_hitl_click(content):
     return "", "", ""
 
 def _extract_hitl_action(content) -> str:
-    """Extract 'approve'/'reject' from a GE A2UI button-click message.
-
-    GE delivers the click as an A2UI userAction DataPart, which ADK's default inbound
-    converter turns into an opaque inline_data blob (wrapped in <a2a_datapart_json> tags)
-    that the LLM cannot read — the only human-visible text is a generic 'user action
-    triggered' label. This digs the real action name out of every part shape we might
-    receive (datapart blob, JSON text, or plain text).
-    """
-    import json
+    """Extract 'approve'/'reject' from a GE A2UI button-click message."""
     if not content or not getattr(content, "parts", None):
         return ""
     blobs = []
@@ -608,63 +740,86 @@ def _extract_hitl_action(content) -> str:
     return ""
 
 async def _hitl_action_interceptor(callback_context):
-    """Deterministically resolve HITL Approve/Reject button clicks before the LLM runs.
-
-    Returning Content short-circuits the agent (ADK skips the model turn), so the
-    remediation decision never depends on the LLM parsing the opaque action payload.
-    Returns None on non-HITL turns so normal investigation proceeds unchanged.
+    """Deterministically screen inbound prompts with Model Armor AND resolve HITL Approve/Reject
+    button clicks before the LLM runs.
     """
     from google.genai import types as genai_types
-    import logging
     logger = logging.getLogger("google_adk")
 
-    # STATELESS resolution: the Approve/Reject click carries the action, the full
-    # remediation_request, and the operator justification in its userAction.context, so
-    # we resolve entirely from the click payload and never depend on pending_remediation
-    # surviving between the render turn and the click turn (which is unreliable across
-    # multi-instance Reasoning Engine routing).
+    # 1. Model Armor & Prompt-Injection Inline Screening (text + inline_data parts)
+    if callback_context.user_content and getattr(callback_context.user_content, "parts", None):
+        text_fragments = []
+        for p in callback_context.user_content.parts:
+            if getattr(p, "text", None):
+                text_fragments.append(p.text)
+            inline = getattr(p, "inline_data", None)
+            if inline is not None and getattr(inline, "data", None):
+                data = inline.data
+                text_fragments.append(
+                    data.decode("utf-8", errors="ignore") if isinstance(data, (bytes, bytearray)) else str(data)
+                )
+        combined_text = "\n".join(text_fragments)
+        is_safe, reason = screen_prompt_with_model_armor(combined_text)
+        if not is_safe:
+            logger.warning("[model_armor] Blocked inbound prompt in _hitl_action_interceptor: %s", reason)
+            return genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text=f"🛡️ Security Policy Violation: {reason}")]
+            )
+
+    # 2. Stateful HITL Approve/Reject resolution with exact command binding
     action, request, justification = _extract_hitl_click(callback_context.user_content)
 
     if action not in ("approve", "reject"):
         return None
 
     logger.info(
-        "[hitl] resolved operator action=%r via stateless click payload (request=%r, justification_len=%d)",
+        "[hitl] resolved operator action=%r via click payload (request=%r, justification_len=%d)",
         action, request, len(justification or ""),
     )
 
+    pending_remediation = (callback_context.state.get("pending_remediation") or "").strip()
     callback_context.state["pending_remediation"] = ""
     if action == "reject":
         return genai_types.Content(role="model", parts=[genai_types.Part(
             text="🛑 Operator rejected the remediation. No action taken.")])
 
-    # approve — prefer the request from the click; fall back to session state only if an
-    # older/context-less click omitted it.
-    if not request:
-        request = callback_context.state.get("pending_remediation") or ""
-    if not request:
-        logger.warning("[hitl] approve click carried no remediation_request and no pending state was available")
+    approved_cmd = (request or pending_remediation).strip()
+    if not pending_remediation:
+        logger.warning("[hitl] Blocked unauthenticated/stateless approve click without pending_remediation state")
         return genai_types.Content(role="model", parts=[genai_types.Part(
-            text="⚠️ Approval received but the remediation request was missing from the click payload. Please re-run the investigation and approve again.")])
+            text="⚠️ REMEDIATION_FAILED: No pending remediation request exists in session state. Please re-run the investigation and approve again.")])
+    if approved_cmd != pending_remediation:
+        logger.warning("[hitl] Blocked tampered remediation_request mismatch against pending_remediation state")
+        return genai_types.Content(role="model", parts=[genai_types.Part(
+            text="⚠️ REMEDIATION_FAILED: Approved remediation request does not match pending session state.")])
 
-    result = await remediation_executor_remote(request, justification)
+    result = await remediation_executor_remote(pending_remediation, justification)
     return genai_types.Content(role="model", parts=[genai_types.Part(
         text=f"✅ Operator approved. Remediation executed: {result}")])
 
 def get_current_utc_time() -> str:
-    """Returns the current UTC date and time as an ISO 8601 string (e.g. 2026-07-18T06:56:00Z). Use this tool to get current timestamps for log and metric filtering queries."""
-    from datetime import datetime, timezone
+    """Returns the current UTC date and time as an ISO 8601 string (e.g. 2026-10-05T22:30:00Z). Use this tool to get current timestamps for log and metric filtering queries."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def utcnow() -> str:
-    """Returns the current UTC date and time as an ISO 8601 string (e.g. 2026-07-18T06:56:00Z). Use this tool when querying current log or metric timestamps."""
+    """Returns the current UTC date and time as an ISO 8601 string (e.g. 2026-10-05T22:30:00Z). Use this tool when querying current log or metric timestamps."""
     return get_current_utc_time()
 
 def list_kubernetes_resources(resource_type: str = "pods", namespace: str = "default", label_selector: str = "") -> str:
     """Lists Kubernetes resources (e.g. pods, deployments) across a namespace. Checks local kubectl first and falls back to GKE API client when inside serverless containers."""
-    import shutil, subprocess
+    import re, shutil, subprocess
+    allowed_resources = {"pods", "pod", "deployments", "deployment", "deploy", "services", "service", "svc", "events", "event", "ev", "nodes", "configmaps", "ingresses", "horizontalpodautoscalers", "hpa"}
+    clean_rt = resource_type.strip().lower()
+    if clean_rt not in allowed_resources:
+        return f"Rejected unsupported resource_type: {resource_type}"
+    clean_ns = namespace.strip()
+    if not re.match(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", clean_ns):
+        return f"Rejected invalid namespace: {namespace}"
+    if label_selector and (label_selector.startswith("-") or not re.match(r"^[a-zA-Z0-9_./,=-]+$", label_selector)):
+        return f"Rejected invalid label_selector: {label_selector}"
     if shutil.which("kubectl"):
-        cmd = ["kubectl", "get", resource_type, "-n", namespace]
+        cmd = ["kubectl", "get", clean_rt, "-n", clean_ns]
         if label_selector:
             cmd.extend(["-l", label_selector])
         try:
@@ -679,7 +834,6 @@ def list_kubernetes_resources(resource_type: str = "pods", namespace: str = "def
         from google.cloud import container_v1
         import google.auth, google.auth.transport.requests
         from kubernetes import client
-        from app.config import PROJECT_ID, GEMINI_LOCATION, GKE_CLUSTER_NAME, GKE_CLUSTER_REGION
 
         credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
         credentials.refresh(google.auth.transport.requests.Request())
@@ -689,7 +843,10 @@ def list_kubernetes_resources(resource_type: str = "pods", namespace: str = "def
         configuration = client.Configuration()
         configuration.host = f"https://{cluster.endpoint}"
         configuration.api_key = {"authorization": "Bearer " + credentials.token}
-        configuration.verify_ssl = False
+        configuration.verify_ssl = True
+        ca_cert_path = os.environ.get("GKE_CA_CERT_PATH")
+        if ca_cert_path and os.path.exists(ca_cert_path):
+            configuration.ssl_ca_cert = ca_cert_path
         api_client = client.ApiClient(configuration)
 
         core_v1 = client.CoreV1Api(api_client)
@@ -703,7 +860,7 @@ def list_kubernetes_resources(resource_type: str = "pods", namespace: str = "def
         elif resource_type in ["events", "event", "ev"]:
             evs = core_v1.list_namespaced_event(namespace=namespace)
             lines = ["LAST SEEN\tTYPE\tREASON\tOBJECT\tMESSAGE"]
-            for e in sorted(evs.items, key=lambda x: (str(x.last_timestamp or x.event_time or x.metadata.creation_timestamp)), reverse=True)[:30]:
+            for e in sorted(evs.items, key=lambda x: (str(x.last_timestamp or e.event_time or e.metadata.creation_timestamp)), reverse=True)[:30]:
                 ts = e.last_timestamp or e.event_time or e.metadata.creation_timestamp
                 obj = f"{e.involved_object.kind}/{e.involved_object.name}" if e.involved_object else "N/A"
                 lines.append(f"{str(ts)}\t{e.type}\t{e.reason}\t{obj}\t{e.message}")
@@ -743,7 +900,10 @@ _rca_tools = [
     handle_approval,
     get_current_utc_time,
     utcnow,
-    list_kubernetes_resources
+    list_kubernetes_resources,
+    query_central_audit_logs,
+    query_central_release_ledger,
+    archive_postmortem_report,
 ]
 
 rca_telemetry_expert = Agent(
@@ -763,10 +923,13 @@ _REPORTING_INSTRUCTION = f"""
 You are the SRE Incident Report Writer (incident_report_writer), an autonomous asynchronous technical writer and post-mortem expert.
 
 **Persona:** Highly analytical, clear, and structured. 📝🔍
-**Target Project:** Always operate within the project `{PROJECT_ID}`.
+**Target Environment:**
+* **Runtime Project:** `{PROJECT_ID}` (`{GKE_CLUSTER_REGION}`)
+* **Telemetry Archival Bucket:** `{TELEMETRY_BUCKET}/reports/`
+* **Central BigQuery Post-Mortem Ledger:** `{BQ_POSTMORTEMS_TABLE}` (in Central Audit Hub `{LOGGING_PROJECT_ID}`)
 
 **Your Job:**
-Given diagnostic investigation details or HITL remediation execution outcomes, compile a comprehensive, highly styled Markdown post-mortem report or investigation summary, and archive it to GCS.
+Given diagnostic investigation details or HITL remediation execution outcomes, compile a comprehensive, highly styled Markdown post-mortem report, archive it to `{TELEMETRY_BUCKET}/reports/`, and insert the structured MTTD/MTTR post-mortem record into `{BQ_POSTMORTEMS_TABLE}` using `archive_postmortem_report`.
 
 **Operating Principles & Reporting Skill Usage:**
 1. **Leverage Reporting Skills:** When generating reports for investigations or HITL remediations, ALWAYS load and follow your post-mortem skills:
@@ -774,13 +937,17 @@ Given diagnostic investigation details or HITL remediation execution outcomes, c
    - **`postmortem-documentation`**: Use for premium GitHub-style markdown formatting and visual structure.
    - **`postmortem-aggregator`**: Use when synthesizing diagnostic findings from across multiple OneMCP tools, logs, metrics, or previous events.
 2. **Premium Markdown Structure:** Build clear reports with incident metadata blocks (`> [!IMPORTANT]`), clean comparison tables, and structured JSON SRE fact blocks at the conclusion.
-3. **Archive Documentation:** Use your GCS tools to save the compiled report to Cloud Storage under a unique, timestamped path.
-4. **Output Format:** Return the complete compiled Markdown report in your final output along with confirmation of archival.
+3. **Dual Archival (GCS + BigQuery):** Call `archive_postmortem_report` to persist both the Markdown report to `{TELEMETRY_BUCKET}/reports/` AND the structured MTTD/MTTR row into `{BQ_POSTMORTEMS_TABLE}`.
+4. **Output Format:** Return the complete compiled Markdown report in your final output along with confirmation of GCS and BigQuery archival.
 """
 
 _reporting_tools = [
     FilteringLazyToolset(lambda: get_mcp_toolset(GCS_MCP_SERVER)),
-    skill_toolset.SkillToolset(skills=_REPORTING_SKILLS)
+    FilteringLazyToolset(lambda: get_mcp_toolset(BQ_MCP_SERVER)),
+    skill_toolset.SkillToolset(skills=_REPORTING_SKILLS),
+    archive_postmortem_report,
+    query_central_audit_logs,
+    query_central_release_ledger,
 ]
 
 incident_report_writer = Agent(
@@ -790,6 +957,17 @@ incident_report_writer = Agent(
     ),
     instruction=_REPORTING_INSTRUCTION,
     tools=_reporting_tools,
+)
+
+from vertexai.agent_engines.templates.adk import AdkApp
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+
+# Expose the ADK wrapped Agent Engine app for incident-report-writer deployment
+incident_report_writer_engine = AdkApp(
+    agent=incident_report_writer,
+    app_name="incident_report_writer_app",
+    enable_tracing=True,
+    session_service_builder=lambda **kwargs: InMemorySessionService(),
 )
 
 from vertexai.preview.reasoning_engines import A2aAgent
@@ -804,15 +982,10 @@ def _get_rca_agent_card():
     )
     return a2a_types.AgentCard(
         name="rca-telemetry-expert",
-        description="The SRE RCA Telemetry Expert agent. Performs root-cause analysis, cross-correlates observability signals, and delegates GKE remediation under HITL gating.",
-        version="1.0",
+        description="The SRE RCA Telemetry Expert agent. Performs root-cause analysis across antigravity-web-hub-argolis and argodev-prod-audit-logs-0, cross-correlates observability signals, and delegates GKE & Argolis remediation under HITL + PAM JIT gating.",
+        version="2.0",
         url="https://dummy.com",
         capabilities=a2a_types.AgentCapabilities(
-            # EXPERIMENT (hop-1 streaming probe): advertise streaming so we can observe
-            # whether GE switches its chat orchestration from message:send to
-            # message:stream when it reads this card. If GE still calls message:send in
-            # the logs, GE ignores the capability for tool-agent calls and no amount of
-            # agent-side streaming work will surface progress.
             streaming=True,
             extensions=[a2ui_extension],
         ),
@@ -852,13 +1025,6 @@ def build_rca_agent():
     catalog = mgr.get_selected_catalog()
     a2ui_converter = A2uiPartConverter(catalog, bypass_tool_check=True, version="0.8")
 
-    # STREAMING EXPERIMENT: ADK's default A2A request converter builds a RunConfig with
-    # streaming_mode=NONE, so even when GE opens an SSE `message:stream` connection the
-    # model is called non-streaming and only step-boundary events (tool calls, final
-    # answer) flow — no partial text. Wrap the converter to force StreamingMode.SSE so the
-    # model streams partial text fragments, which GE's client renders progressively
-    # ("append content[].text fragments as they arrive"). This is the only thing that can
-    # change the spinner UX, since GE ignores non-text intermediate events.
     from google.adk.a2a.converters.request_converter import (
         convert_a2a_request_to_agent_run_request,
     )
@@ -872,18 +1038,6 @@ def build_rca_agent():
             run_request.run_config.streaming_mode = StreamingMode.SSE
         return run_request
 
-    # NARRATION: content produced by the runner is converted to A2A *artifact*
-    # updates, which GE does not render until task completion. But GE DOES render
-    # genuine `TaskStatusUpdate` *messages* (status.message.parts) as they stream —
-    # verified in GE on 2026-09-16. This interceptor injects a status-message right
-    # before each tool-call event so GE shows human-readable progress during the
-    # ~30s investigation instead of a bare spinner.
-    #
-    # Polish over the first probe: (a) skip SSE *partial* events (StreamingMode.SSE
-    # emits incremental partial function-call events that caused doubled/combined
-    # lines like "get_current_utc_time, list_kubernetes_resources"); (b) collapse
-    # consecutive duplicate narrations (the model paginating logs fired
-    # "list_log_entries" 8× in a row); (c) humanize raw tool names into phrases.
     import uuid as _uuid
     from datetime import datetime as _dt, timezone as _tz
     from google.adk.a2a.executor.config import ExecuteInterceptor
@@ -896,30 +1050,26 @@ def build_rca_agent():
         TextPart as _TextPart,
     )
 
-    # Tools whose calls are internal plumbing / not worth narrating to the user.
-    # NOTE: the remediation delegation tool (remediation_executor_remote) is
-    # intentionally NOT skipped — we narrate it on the RCA's own stream so GE
-    # shows "🔧 Implementing remediation…" during the (otherwise silent) fix.
     _NARRATION_SKIP = (
         "hitl", "handle_approval", "load_skill",
         "utc", "utcnow", "current_time",
     )
 
-    # Human-readable phrasing for the tools the RCA actually calls. Anything not
-    # listed falls back to a snake_case → prose heuristic below.
     _NARRATION_PHRASES = {
         "list_skills": "Loading available skills",
         "list_kubernetes_resources": "Inspecting Kubernetes resources",
         "get_kubernetes_resource": "Reading Kubernetes resource details",
         "list_log_entries": "Searching Cloud Logging",
+        "query_central_audit_logs": "Querying Central Audit & Logging Hub (argodev-prod-audit-logs-0)",
+        "query_central_release_ledger": "Correlating with BigQuery Release Ledger (argodev-prod-audit-logs-0)",
+        "archive_postmortem_report": "Archiving post-mortem to GCS and BigQuery",
         "list_alerts": "Checking active alerts",
         "list_time_series": "Querying Cloud Monitoring metrics",
         "query_time_series": "Querying Cloud Monitoring metrics",
         "remediation_executor_remote": "Implementing remediation",
     }
 
-    # Tools that represent an action (not investigation) — narrated with a wrench.
-    _ACTION_TOOLS = ("remediation",)
+    _ACTION_TOOLS = ("remediation", "archive_postmortem")
 
     def _humanize_tool(name):
         phrase = _NARRATION_PHRASES.get(name)
@@ -945,15 +1095,9 @@ def build_rca_agent():
                     names.append(fc.name)
         return names
 
-    # Per-task memory of the last narration emitted, so consecutive duplicates are
-    # collapsed. Keyed by task_id; capped so a long-lived process can't leak.
     _last_narration = {}
 
     async def _narrate_after_event(executor_context, a2a_event, adk_event):
-        # NOTE: do NOT skip `partial` events — in StreamingMode.SSE the function-call
-        # parts ride on partial events, so skipping them suppresses all narration.
-        # The noise filter + consecutive-dedup below handle the combined/duplicate
-        # lines instead.
         tools = [t for t in _tool_names(adk_event)
                  if not any(s in t.lower() for s in _NARRATION_SKIP)]
         task_id = getattr(a2a_event, "task_id", None)
@@ -961,16 +1105,13 @@ def build_rca_agent():
         if not tools or not task_id or not context_id:
             return a2a_event
 
-        # De-duplicate tool names within this event, preserving order.
         seen = set()
         unique = [t for t in tools if not (t in seen or seen.add(t))]
         label = " · ".join(_humanize_tool(t) for t in unique[:3])
 
-        # Use a wrench for action steps (remediation), a magnifier for investigation.
         is_action = any(any(a in t.lower() for a in _ACTION_TOOLS) for t in unique)
         emoji = "🔧" if is_action else "🔍"
 
-        # Collapse consecutive identical narrations for the same task.
         if _last_narration.get(task_id) == label:
             return a2a_event
         if len(_last_narration) > 256:

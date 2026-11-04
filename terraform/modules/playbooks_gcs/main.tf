@@ -23,26 +23,32 @@ resource "google_storage_bucket" "playbooks_bucket" {
   depends_on = [var.depends_on_apis]
 }
 
-resource "google_storage_bucket_object" "playbook_scale_recovery" {
-  name   = "playbooks/gke-scale-recovery.md"
-  bucket = google_storage_bucket.playbooks_bucket.name
-  source = "${abspath(path.root)}/../app/skills/playbooks/gke-scale-recovery/SKILL.md"
+locals {
+  playbooks = toset([
+    "gke-scale-recovery",
+    "gke-crashloop-rollback",
+    "gke-pod-restart",
+    "gke-horizontal-upsize",
+    "gke-network-firewall-recovery",
+    "gke-service-routing-recovery",
+    "gke-dns-recovery",
+    "gcp-nat-port-recovery",
+    "argolis-cloudrun-iap-recovery",
+    "argolis-vertex-quota-failover",
+    "argolis-sharedvpc-logsink-recovery",
+  ])
 }
 
-resource "google_storage_bucket_object" "playbook_crashloop_rollback" {
-  name   = "playbooks/gke-crashloop-rollback.md"
-  bucket = google_storage_bucket.playbooks_bucket.name
-  source = "${abspath(path.root)}/../app/skills/playbooks/gke-crashloop-rollback/SKILL.md"
+resource "google_storage_bucket_object" "playbook_files" {
+  for_each = local.playbooks
+  name     = "playbooks/${each.key}/SKILL.md"
+  bucket   = google_storage_bucket.playbooks_bucket.name
+  source   = "${abspath(path.root)}/../app/skills/playbooks/${each.key}/SKILL.md"
 }
 
-resource "google_storage_bucket_object" "playbook_pod_restart" {
-  name   = "playbooks/gke-pod-restart.md"
-  bucket = google_storage_bucket.playbooks_bucket.name
-  source = "${abspath(path.root)}/../app/skills/playbooks/gke-pod-restart/SKILL.md"
-}
-
-resource "google_storage_bucket_object" "playbook_horizontal_upsize" {
-  name   = "playbooks/gke-horizontal-upsize.md"
-  bucket = google_storage_bucket.playbooks_bucket.name
-  source = "${abspath(path.root)}/../app/skills/playbooks/gke-horizontal-upsize/SKILL.md"
+resource "google_storage_bucket_object" "playbook_flat_files" {
+  for_each = local.playbooks
+  name     = "playbooks/${each.key}.md"
+  bucket   = google_storage_bucket.playbooks_bucket.name
+  source   = "${abspath(path.root)}/../app/skills/playbooks/${each.key}/SKILL.md"
 }

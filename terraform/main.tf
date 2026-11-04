@@ -36,11 +36,12 @@ module "foundation" {
 }
 
 module "bq_seed" {
-  source          = "./modules/bq_seed"
-  gcp_project_id  = var.gcp_project_id
-  gcp_region      = var.gcp_region
-  depends_on_apis = module.foundation.apis_enabled
-  depends_on      = [module.foundation]
+  source             = "./modules/bq_seed"
+  gcp_project_id     = var.gcp_project_id
+  logging_project_id = var.logging_project_id
+  gcp_region         = var.gcp_region
+  depends_on_apis    = module.foundation.apis_enabled
+  depends_on         = [module.foundation]
 }
 
 module "playbooks_gcs" {
@@ -61,10 +62,12 @@ module "networking" {
 }
 
 module "iam" {
-  source          = "./modules/iam"
-  gcp_project_id  = var.gcp_project_id
-  depends_on_apis = module.foundation.apis_enabled
-  depends_on      = [module.foundation]
+  source                = "./modules/iam"
+  gcp_project_id        = var.gcp_project_id
+  logging_project_id    = var.logging_project_id
+  telemetry_bucket_name = module.foundation.staging_bucket_name
+  depends_on_apis       = module.foundation.apis_enabled
+  depends_on            = [module.foundation]
 }
 
 module "gke_demo" {
@@ -81,9 +84,14 @@ module "gke_demo" {
 module "agent_deployer" {
   source                = "./modules/agent_deployer"
   gcp_project_id        = var.gcp_project_id
+  logging_project_id    = var.logging_project_id
   gcp_region            = var.gcp_region
   staging_bucket_name   = module.foundation.staging_bucket_name
   service_account_email = module.iam.sre_agent_sa_email
+  investigator_sa_email = module.iam.investigator_sa_email
+  remediator_sa_email   = module.iam.remediator_sa_email
+  reporter_sa_email     = module.iam.reporter_sa_email
+  simulator_sa_email    = module.iam.simulator_sa_email
   gemini_model          = var.gemini_model
   deploy_agents         = var.deploy_agents
   depends_on_apis       = module.foundation.apis_enabled

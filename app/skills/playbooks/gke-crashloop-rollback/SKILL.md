@@ -7,7 +7,7 @@ description: Playbook 2 (Tier 1 Auto-Rollback) — Use when a GKE deployment (li
 
 ## Target Scenario
 * **Target Microservices**: `cartservice` (or any deployment whose container status shows `CrashLoopBackOff` or `ErrImagePull` right after a code push or image rollout).
-* **Diagnostic Trigger**: `get_pod_logs` shows initialization exceptions or `sre-correlation` (BigQuery `sre_releases.recent_releases`) verifies a recent deployment (`REL-042: broken-v2`) pushed right before crashes started.
+* **Diagnostic Trigger**: `get_pod_logs` shows initialization exceptions or `sre-correlation` (BigQuery `argodev-prod-audit-logs-0.sre_releases.recent_releases` / `sre_releases.recent_releases`) verifies a recent deployment (`REL-042: broken-v2`) pushed right before crashes started.
 
 ## Remediation Action (Tier 1 - Fast-Path Auto-Rollback)
 1. You are pre-approved to automatically execute a deployment rollback to immediately revert the broken image and restore checkout functionality.

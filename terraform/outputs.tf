@@ -9,8 +9,33 @@ output "gke_cluster_endpoint" {
 }
 
 output "sre_agent_service_account" {
-  description = "The dedicated execution Service Account email for Reasoning Engines."
+  description = "Backward-compatible alias pointing to the Investigator Service Account email."
   value       = module.iam.sre_agent_sa_email
+}
+
+output "investigator_sa_email" {
+  description = "Email of the read-only rca-telemetry-expert Service Account."
+  value       = module.iam.investigator_sa_email
+}
+
+output "remediator_sa_email" {
+  description = "Email of the mutating remediation-executor Service Account."
+  value       = module.iam.remediator_sa_email
+}
+
+output "reporter_sa_email" {
+  description = "Email of the incident-report-writer Service Account."
+  value       = module.iam.reporter_sa_email
+}
+
+output "simulator_sa_email" {
+  description = "Email of the outage-simulator Service Account."
+  value       = module.iam.simulator_sa_email
+}
+
+output "logging_project_id" {
+  description = "The Central Audit & Logging Hub (cs-audit) Google Cloud Project ID."
+  value       = var.logging_project_id
 }
 
 output "staging_bucket" {

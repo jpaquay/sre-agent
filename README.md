@@ -1,132 +1,141 @@
-# 🛡️ NovaSRE — Autonomous Site Reliability Engineering Platform (ADK 2.0 & A2A)
+# 🛡️ NovaSRE — Autonomous Site Reliability Engineering Platform (ADK 2.0, A2A & Argolis WAF Edition)
 
 ![NovaSRE Architecture Banner](docs/architecture.png)
 
-Welcome to **NovaSRE**, an enterprise-grade autonomous Site Reliability Engineering (SRE) and self-healing infrastructure platform built on **Google Cloud Vertex AI Reasoning Engines (ADK 2.0)**, **Agent-to-Agent (A2A) Protocols**, and universal **OneMCP APIs**.
+Welcome to **NovaSRE**, an enterprise-grade autonomous Site Reliability Engineering (SRE) and self-healing infrastructure platform built on **Google Cloud Vertex AI Reasoning Engines (ADK 2.0)**, **Agent-to-Agent (A2A) Protocols**, **A2UI v0.8 HITL Cards**, **Model Armor**, and universal **OneMCP APIs**.
 
-NovaSRE transforms cloud operations from reactive firefighting into proactive, policy-driven self-healing. The platform pairs a live **GKE Autopilot microservices cluster (`online-boutique`)** with autonomous AI agents that diagnose root causes, cross-correlate observability signals with BigQuery deployment ledgers, and execute surgical remediation under strict **least-privilege security** and **Human-in-the-Loop (`HITL`) approval gates**.
+NovaSRE operates across a hardened **Hub-and-Spoke multi-project architecture** in **`europe-west1`** within the `jpaquay.altostrat.com` Argolis organization:
+- **Spoke / Runtime Host Project (`antigravity-web-hub-argolis`, `723040006558`)**: Hosts the 4 Vertex AI Reasoning Engines (`rca-telemetry-expert`, `remediation-executor`, `outage-simulator`, `incident-report-writer`), the `online-boutique` GKE Autopilot cluster, Direct IAP-protected Cloud Run services, and the `gs://antigravity-web-hub-argolis-telemetry` & `gs://antigravity-web-hub-argolis-sre-playbooks` buckets.
+- **Central Logging & Audit Hub (`argodev-prod-audit-logs-0` / `cs-audit`, `618001173803`)**: Aggregates cross-project GKE, Cloud Run, Reasoning Engine, and Privileged Access Manager (PAM) logs via Cloud Logging sinks (`sre-gke-pam-telemetry-sink`) and hosts the `sre_releases` BigQuery dataset (`recent_releases` and `incident_postmortems` with `PHYSICAL` storage billing in `europe-west1`).
+
+> 📖 **Architecture & Operator Documentation**:
+> - [**WAF ADR & Master Implementation Plan**](docs/WAF_ADR_AND_IMPLEMENTATION_PLAN.md)
+> - [**Argolis 11-Scenario SRE Operator Runbook**](docs/ARGOLIS_SRE_PLAYBOOKS_RUNBOOK.md)
+> - [**WAF 5-Pillar Architecture Blueprint**](docs/WAF_ARCHITECTURE_BLUEPRINT.md)
+> - [**Platform Architecture & Workflow Deep-Dive**](docs/architecture.md)
+> - [**Gemini Enterprise Agent Registration Guide**](register_agent.md)
 
 ---
 
-## 🏗️ 1. Platform Architecture & Workflow
+## 🏗️ 1. Platform Architecture & Hub-and-Spoke Workflow
 
-The NovaSRE ecosystem consists of specialized Vertex AI Reasoning Engine agents registered with **Gemini Enterprise** as the operator front door, a 4-layer Modular Skill Repository, and universal OneMCP Gateways interacting securely across Google Cloud:
+The NovaSRE ecosystem consists of 4 specialized Vertex AI Reasoning Engine agents isolated by **4 dedicated least-privilege Service Accounts**, protected by **Model Armor** inline screening, registered with **Gemini Enterprise** and the **`aibru26` SRE Sentinel / Copilot** as operator front doors, and backed by **35 modular skills**:
 
 ```mermaid
 graph TD
-    subgraph Gemini Enterprise [Operator Front Door: Gemini Enterprise]
-        GE[Gemini Enterprise Console<br/>Natural-Language Chat, Routing<br/>& A2UI Human-in-the-Loop Approval]
+    subgraph FrontDoors ["Operator Front Doors (europe-west1)"]
+        GE["Gemini Enterprise Console<br/>Natural-Language Chat, Routing<br/>& A2UI v0.8 HITL Approval"]
+        COPILOT["aibru26 SRE Sentinel & Copilot<br/>12-Agent A2A Arena Integration"]
     end
 
-    subgraph Vertex AI Reasoning Engines [Google Cloud Vertex AI Serverless Agents]
-        InvAgent[Investigator Agent<br/><b>rca_telemetry_expert</b><br/>Read-Only Diagnostician]
-        RemAgent[Remediation Worker<br/><b>remediation_executor</b><br/>A2A Mutating Engine]
-        DocAgent[Documentation Compiler<br/><b>incident_report_writer</b><br/>Post-Mortem Writer]
-        SimAgent[Chaos Engine<br/><b>outage_simulator</b><br/>Chaos Engineering]
+    subgraph RuntimeHost ["Spoke Runtime Host: antigravity-web-hub-argolis (723040006558 / europe-west1)"]
+        MA["Model Armor Inline Screening<br/>Prompt Injection & SDP Guard"]
+        InvAgent["Investigator Agent<br/><b>rca-telemetry-expert</b><br/>SA: sre-investigator-sa (Read-Only)"]
+        RemAgent["Remediation Worker<br/><b>remediation-executor</b><br/>SA: sre-remediator-sa (A2A + PAM JIT)"]
+        DocAgent["Documentation Compiler<br/><b>incident-report-writer</b><br/>SA: sre-reporter-sa (Async Writer)"]
+        SimAgent["Chaos Engine<br/><b>outage-simulator</b><br/>SA: sre-simulator-sa (11 Simulations)"]
+        GKE["GKE Autopilot: online-boutique<br/>europe-west1 (12 Microservices)"]
+        GCS["GCS Buckets<br/>gs://antigravity-web-hub-argolis-telemetry<br/>& gs://antigravity-web-hub-argolis-sre-playbooks"]
     end
 
-    subgraph Modular Skill Ecosystem [app/skills/ & GCS Playbook Bucket]
-        DiagSkills[Layer 1: Diagnostics & Triage<br/>10 Specialist Skills]
-        PlaybookSkills[Layer 2: Recovery Playbooks<br/>8 SRE Remediation Playbooks]
-        SimSkills[Layer 3: Chaos Simulations<br/>8 Outage Injection Playbooks]
-        ReportSkills[Layer 4: Incident Reporting<br/>3 Post-Mortem Skills]
+    subgraph SkillEcosystem ["Modular Skill Ecosystem (35 Skills)"]
+        DiagSkills["Layer 1: Diagnostics & Triage<br/>10 Specialist Skills"]
+        PlaybookSkills["Layer 2: Recovery Playbooks<br/>11 SRE Remediation Playbooks"]
+        SimSkills["Layer 3: Chaos Simulations<br/>11 Outage Injection Playbooks"]
+        ReportSkills["Layer 4: Incident Reporting<br/>3 Post-Mortem Skills"]
     end
 
-    subgraph Universal OneMCP Gateway [Google Cloud OneMCP API Layer]
-        LOG_MCP[Logging OneMCP<br/>logging.googleapis.com]
-        MON_MCP[Monitoring OneMCP<br/>monitoring.googleapis.com]
-        TRACE_MCP[Trace OneMCP<br/>cloudtrace.googleapis.com]
-        ERR_MCP[Error Reporting OneMCP<br/>clouderrorreporting.googleapis.com]
-        GKE_MCP[GKE OneMCP<br/>container.googleapis.com]
-        COMPUTE_MCP[Compute & VPC OneMCP<br/>compute.googleapis.com]
-        BQ_MCP[BigQuery OneMCP<br/>bigquery.googleapis.com]
-        GCS_MCP[GCS OneMCP<br/>storage.googleapis.com]
+    subgraph OneMCPGateway ["Universal OneMCP Gateway (Dual-Project Aware)"]
+        LOG_MCP["Logging OneMCP<br/>logging.googleapis.com"]
+        MON_MCP["Monitoring OneMCP<br/>monitoring.googleapis.com"]
+        TRACE_MCP["Trace OneMCP<br/>cloudtrace.googleapis.com"]
+        ERR_MCP["Error Reporting OneMCP<br/>clouderrorreporting.googleapis.com"]
+        GKE_MCP["GKE OneMCP<br/>container.googleapis.com"]
+        COMPUTE_MCP["Compute & VPC OneMCP<br/>compute.googleapis.com"]
+        BQ_MCP["BigQuery OneMCP<br/>bigquery.googleapis.com"]
+        GCS_MCP["GCS OneMCP<br/>storage.googleapis.com"]
     end
 
-    subgraph Production Infrastructure [GCP & GKE Environment]
-        GKE[GKE Autopilot Cluster: online-boutique<br/>12 Microservices under Synthetic Load]
-        BQ[BigQuery Ledger<br/>sre_releases.recent_releases]
-        GCS[GCS Bucket<br/>gs://project-telemetry & Playbooks]
+    subgraph AuditHub ["Central Logging & Audit Hub: argodev-prod-audit-logs-0 (618001173803 / cs-audit)"]
+        BQ_REL["BigQuery: sre_releases.recent_releases<br/>PHYSICAL Billing + Clustered"]
+        BQ_INC["BigQuery: sre_releases.incident_postmortems<br/>MTTD/MTTR + PAM Grant Audit"]
+        BQ_AUDIT["BigQuery: audit_export & agent_analytics<br/>Cross-Org Audit Logs & OTel Spans"]
     end
 
-    %% Gemini Enterprise & Agent Interactions
-    GE <-->|1. Trigger Alert / Natural Chat| InvAgent
-    GE -->|2. Trigger Controlled Scenario| SimAgent
-    GE -->|3. HITL Operator Approval| InvAgent
+    GE <-->|"1. Trigger Alert / HITL Approval"| MA
+    COPILOT <-->|"A2A / REST"| MA
+    MA <--> InvAgent
+    GE -->|"2. Trigger Chaos Scenario"| SimAgent
 
-    %% Agent-to-Agent (A2A) and Worker Delegation
-    InvAgent -->|A2A Protocol: Execute Approved Healing| RemAgent
-    InvAgent -.->|Async Post-Mortem Compilation| DocAgent
+    InvAgent -->|"A2A + [PAM_JUSTIFICATION]"| RemAgent
+    InvAgent -.->|"Async Zero-Call Post-Mortem"| DocAgent
 
-    %% Skills Association
     InvAgent --- DiagSkills
     InvAgent --- PlaybookSkills
     SimAgent --- SimSkills
     DocAgent --- ReportSkills
 
-    %% OneMCP Connections - Investigator
-    InvAgent -->|Triage Logs & Metrics| LOG_MCP
-    InvAgent -->|Query PromQL & Timeseries| MON_MCP
-    InvAgent -->|Decompose Spans & Latency| TRACE_MCP
-    InvAgent -->|Inspect Exception Groups| ERR_MCP
-    InvAgent -->|Inspect Pod & Service State| GKE_MCP
-    InvAgent -->|Audit VPC / NAT / Firewalls| COMPUTE_MCP
-    InvAgent -->|Correlate Rollout History| BQ_MCP
-    InvAgent -->|Load Remote SOPs| GCS_MCP
+    InvAgent --> LOG_MCP
+    InvAgent --> MON_MCP
+    InvAgent --> TRACE_MCP
+    InvAgent --> ERR_MCP
+    InvAgent --> GKE_MCP
+    InvAgent --> COMPUTE_MCP
+    InvAgent --> BQ_MCP
+    InvAgent --> GCS_MCP
 
-    %% OneMCP Connections - Workers & Simulators
-    RemAgent -->|Declarative Workload Patches| GKE_MCP
-    RemAgent -->|Declarative Router / Firewall Updates| COMPUTE_MCP
-    SimAgent -->|Inject Workload / Network Failure| GKE_MCP
-    DocAgent -->|Archive Markdown Reports| GCS_MCP
+    RemAgent --> GKE_MCP
+    RemAgent --> COMPUTE_MCP
+    SimAgent --> GKE_MCP
+    DocAgent --> GCS_MCP
+    DocAgent --> BQ_MCP
 
-    %% OneMCP to Infrastructure
-    LOG_MCP --> GKE
-    MON_MCP --> GKE
-    TRACE_MCP --> GKE
-    ERR_MCP --> GKE
     GKE_MCP --> GKE
     COMPUTE_MCP --> GKE
-    BQ_MCP --> BQ
+    BQ_MCP --> BQ_REL
+    BQ_MCP --> BQ_INC
+    LOG_MCP --> BQ_AUDIT
     GCS_MCP --> GCS
 ```
 
-### Core Agents & Roles Summary
+### Core Agents & Dedicated Service Accounts (`antigravity-web-hub-argolis`)
 
-1. **`rca_telemetry_expert` (The Diagnostician & Unified Investigator)**:
-   * **Privilege Level**: Strictly **Read-Only**.
-   * **Function**: Serves as the primary intelligence hub for incident response. Performs baseline triage via Cloud Logging and Cloud Monitoring, loads the generic `investigation-entrypoint` skill to categorize the failure domain, and conditionally loads specialized diagnostic skills (`gke-workloads`, `gke-networking`, `google-cloud-networking-observability`, `google-cloud-global-frontend-configuration`, `gcp-trace`, `gcp-error-reporting`, `sre-correlation`).
-   * **Delegation**: When the root cause is isolated, it loads the corresponding SRE Playbook and delegates execution to `remediation_executor` via Google's Agent-to-Agent (A2A) protocol.
+1. **`rca-telemetry-expert` (The Diagnostician & Unified Investigator)**:
+   * **Dedicated Identity**: `sre-investigator-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com` (**Strictly Read-Only** on `antigravity-web-hub-argolis` + cross-project `logging.viewer`, `bigquery.dataViewer`, and `bigquery.jobUser` on `argodev-prod-audit-logs-0`).
+   * **Model Routing**: Uses `gemini-2.5-flash` (`GEMINI_MODEL`) for fast baseline triage with automatic `global` $\leftrightarrow$ `europe-west1` failover, and `gemini-3.1-pro-preview` (`GEMINI_PRO_MODEL`) for Tier 3 zero-day escalation.
+   * **Function**: Screens prompts with **Model Armor** (`screen_prompt_with_model_armor`), performs dual-project triage across `antigravity-web-hub-argolis` and `argodev-prod-audit-logs-0` (`cs-audit`), loads the `investigation-entrypoint` and specialist diagnostic skills, correlates with `argodev-prod-audit-logs-0.sre_releases.recent_releases`, and delegates remediation to `remediation-executor` via A2A.
 
-2. **`remediation_executor` (The Secure Healing Worker)**:
-   * **Privilege Level**: **Write-Enabled** (`container.developer`, `compute.networkAdmin`).
-   * **Function**: Operates as a dedicated, least-privilege execution agent exposed via the Vertex AI `A2aAgent` template. Receives structured healing commands over A2A, translates them into declarative OneMCP API operations (`patch_k8s_resource`, `update_router_nat`, `patch_firewall_rule`), verifies post-remediation health, and returns verified execution timestamps.
+2. **`remediation-executor` (The Secure Healing Worker)**:
+   * **Dedicated Identity**: `sre-remediator-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com` (**Mutating Worker**: `container.developer`, `compute.networkAdmin`, plus `eligibleUser` on the `gke-editor` **Privileged Access Manager (PAM)** entitlement).
+   * **Function**: Receives structured healing commands over A2A, verifies PAM JIT elevation and `[PAM_JUSTIFICATION]:` audit trails for Tier 2 HITL actions, executes declarative OneMCP API operations, and returns verified recovery timestamps.
 
-3. **`incident_report_writer` (The Documentation Compiler & Post-Mortem Expert)**:
-   * **Privilege Level**: **Storage Write** (`storage.objectAdmin`).
-   * **Function**: An autonomous technical writer that compiles comprehensive, publication-ready GitHub Flavored Markdown post-mortems following incident mitigation. Uses log-derived timestamps (`incident_start_time`, `detection_time`, `mitigation_executed_time`, `recovery_verified_time`) to generate chronological timeline tables without redundant secondary telemetry API calls, and automatically archives reports to Cloud Storage (`gs://<bucket>/reports/post_mortem_*.md`).
+3. **`incident-report-writer` (The Documentation Compiler & Post-Mortem Expert)**:
+   * **Dedicated Identity**: `sre-reporter-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com` (`storage.objectAdmin` on `gs://antigravity-web-hub-argolis-telemetry`, plus cross-project `roles/bigquery.dataEditor` and `roles/bigquery.jobUser` on `argodev-prod-audit-logs-0:sre_releases`).
+   * **Function**: Compiles publication-ready GitHub Flavored Markdown post-mortems asynchronously using pre-extracted log timestamps (zero extra telemetry calls), archives reports to `gs://antigravity-web-hub-argolis-telemetry/reports/post_mortem_<id>.md`, and inserts structured MTTD/MTTR rows into `argodev-prod-audit-logs-0.sre_releases.incident_postmortems`.
 
-4. **`outage_simulator` (The Chaos Engineering Agent)**:
-   * **Function**: An autonomous chaos engineering agent that dynamically loads simulation playbooks from `app/skills/simulations/` and injects controlled failure modes (pod crashes, replica downscales, bad image rollouts, CoreDNS outages, NetworkPolicy isolation, Cloud NAT port drops, and broken service routing) into the `online-boutique` GKE cluster.
-
-> **Operator Front Door**: NovaSRE has no bespoke UI. Operators interact with the platform through **Gemini Enterprise**, where the `outage_simulator` and `rca_telemetry_expert` agents are registered (see §7). Gemini Enterprise handles natural-language chat, routing, and renders the **Human-in-the-Loop (`HITL`) approval widgets** (via A2UI) that gate Tier 2 remediation.
+4. **`outage-simulator` (The Chaos Engineering Agent)**:
+   * **Dedicated Identity**: `sre-simulator-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com` (`container.developer` on target cluster).
+   * **Function**: Dynamically loads all **11 simulation playbooks** from `app/skills/simulations/` to inject controlled failure modes across GKE `online-boutique` and the Argolis fleet.
 
 ---
 
-## 🌟 2. Comprehensive 8-Scenario Chaos & Self-Healing Matrix
+## 🌟 2. Comprehensive 11-Scenario Chaos & Self-Healing Matrix (8 GKE + 3 Argolis Fleet)
 
-NovaSRE provides 8 fully orchestrated scenarios spanning Kubernetes workloads, container rollouts, database availability, traffic routing, DNS resolution, and cloud network infrastructure:
+NovaSRE provides **11 fully orchestrated scenarios** spanning Kubernetes workloads, container rollouts, database availability, traffic routing, DNS resolution, Cloud NAT, Direct Cloud Run IAP, Vertex AI quota/model failover, and Shared VPC / Log Router sinks:
 
-| # | Scenario ID | Target Resource | Simulated Outage Action (`outage_simulator`) | SRE Recovery Playbook (`app/skills/playbooks/`) | Governance Tier & Execution Policy |
+| # | Scenario / Simulation Skill | Target Resource (`europe-west1`) | Simulated Outage Action (`outage-simulator`) | SRE Recovery Playbook (`app/skills/playbooks/`) | Governance Tier & Execution Policy |
 | :- | :--- | :--- | :--- | :--- | :--- |
-| **1** | `gke-scale-outage` | `frontend` | Scales active replicas to **`0`** (`replicas: 0`) causing HTTP 503 errors across the store. | **Playbook 1 (`gke-scale-recovery`)**: Scale `frontend` back to `1` active replica. | **Tier 1 (Auto-Recovery)**<br>Pre-approved fast-path. Auto-healed via A2A. |
-| **2** | `gke-bad-rollout` | `cartservice` | Deploys invalid container revision (`cartservice:broken-v2`) causing pod `CrashLoopBackOff`. | **Playbook 2 (`gke-crashloop-rollback`)**: Correlates BigQuery release ledger and reverts to previous stable image (`v1.0.4`). | **Tier 1 (Auto-Rollback)**<br>Causal deployment correlation fast-path. Auto-reverted via A2A. |
-| **3** | `gke-dns-outage` | `coredns` (`kube-system`) | Scales CoreDNS to **`0`** replicas, inducing cluster-wide `.svc.cluster.local` resolution timeouts. | **Playbook 6 (`gke-dns-recovery`)**: Scale CoreDNS deployment back to `2` healthy replicas. | **Tier 1 (Auto-Recovery)**<br>Cluster infrastructure fast-path. Auto-scaled via A2A. |
-| **4** | `gke-pod-crash` | `redis-cart` | Terminates active pods and simulates connection pool memory locks. | **Playbook 3 (`gke-pod-restart`)**: Execute clean rolling restart (`rollout restart deployment/redis-cart`). | **Tier 2 (HITL Approval)**<br>Requires operator approval before database disruption. |
-| **5** | `gke-payment-latency` | `paymentservice` | Throttles capacity to `1 replica` under peak synthetic checkout surges, causing p99 latency `>2000ms`. | **Playbook 4 (`gke-horizontal-upsize`)**: Scale deployment up to **`3 replicas`** to absorb load. | **Tier 2 (HITL Approval)**<br>Requires operator approval for capacity/cost scaling. |
-| **6** | `gke-network-firewall-block` | `checkoutservice` | Injects restrictive `NetworkPolicy` dropping all ingress and egress packets. | **Playbook 5 (`gke-network-firewall-recovery`)**: Delete blocking NetworkPolicy to restore pod networking. | **Tier 2 (HITL Approval)**<br>Requires operator confirmation to modify network policies. |
-| **7** | `gcp-nat-port-drop` | `nat-gateway-us-central1` | Simulates Cloud NAT SNAT port exhaustion and outbound packet drop. | **Playbook 7 (`gcp-nat-port-recovery`)**: Increase `minPortsPerVm` from 64 to 256 on Cloud NAT gateway. | **Tier 2 (HITL Approval)**<br>Requires operator confirmation for VPC gateway reconfiguration. |
-| **8** | `gke-service-routing-break` | `checkoutservice` (Service) | Patches K8s Service selector to invalid `app=broken-selector`, disconnecting endpoints. | **Playbook 8 (`gke-service-routing-recovery`)**: Restore Service selector to target `app=checkoutservice`. | **Tier 2 (HITL Approval)**<br>Requires operator confirmation to patch Service definitions. |
+| **1** | `gke-scale-outage` | `frontend` (`online-boutique`) | Scales active replicas to **`0`** (`replicas: 0`) causing HTTP 503 errors across the store. | **Playbook 1 (`gke-scale-recovery`)**: Scale `frontend` back to `1` active replica. | **Tier 1 (Auto-Recovery)**<br>Pre-approved fast-path. Auto-healed via A2A. |
+| **2** | `gke-bad-rollout` | `cartservice` (`online-boutique`) | Deploys invalid container revision (`cartservice:broken-v2`) causing pod `CrashLoopBackOff`. | **Playbook 2 (`gke-crashloop-rollback`)**: Correlates `argodev-prod-audit-logs-0.sre_releases.recent_releases` and reverts to `v1.0.4`. | **Tier 1 (Auto-Rollback)**<br>Causal deployment correlation fast-path. Auto-reverted via A2A. |
+| **3** | `gke-pod-crash` | `redis-cart` (`online-boutique`) | Terminates active pods and simulates connection pool memory locks. | **Playbook 3 (`gke-pod-restart`)**: Execute clean rolling restart (`rollout restart deployment/redis-cart`). | **Tier 2 (HITL + PAM JIT)**<br>Requires operator approval before database disruption. |
+| **4** | `gke-payment-latency` | `paymentservice` (`online-boutique`) | Throttles capacity to `1 replica` under peak synthetic checkout surges, causing p99 latency `>2000ms`. | **Playbook 4 (`gke-horizontal-upsize`)**: Scale deployment up to **`3 replicas`** to absorb load. | **Tier 2 (HITL + PAM JIT)**<br>Requires operator approval for capacity/cost scaling. |
+| **5** | `gke-network-firewall-block` | `checkoutservice` (`online-boutique`) | Injects restrictive `NetworkPolicy` dropping all ingress and egress packets. | **Playbook 5 (`gke-network-firewall-recovery`)**: Delete blocking NetworkPolicy to restore pod networking. | **Tier 2 (HITL + PAM JIT)**<br>Requires operator confirmation to modify network policies. |
+| **6** | `gke-dns-outage` | `coredns` (`kube-system`) | Scales CoreDNS to **`0`** replicas, inducing cluster-wide `.svc.cluster.local` resolution timeouts. | **Playbook 6 (`gke-dns-recovery`)**: Scale CoreDNS deployment back to `2` healthy replicas. | **Tier 1 / Tier 2 Recovery**<br>Restores cluster DNS capacity via A2A. |
+| **7** | `gcp-nat-port-drop` | `sre-agent-nat` (`europe-west1`) | Simulates Cloud NAT SNAT port exhaustion and outbound packet drop. | **Playbook 7 (`gcp-nat-port-recovery`)**: Increase `minPortsPerVm` from 64 to 256 on Cloud NAT gateway. | **Tier 2 (HITL + PAM JIT)**<br>Requires operator confirmation for VPC gateway reconfiguration. |
+| **8** | `gke-service-routing-break` | `checkoutservice` (K8s Service) | Patches K8s Service selector to invalid `app=broken-selector`, disconnecting endpoints. | **Playbook 8 (`gke-service-routing-recovery`)**: Restore Service selector to target `app=checkoutservice`. | **Tier 2 (HITL + PAM JIT)**<br>Requires operator confirmation to patch Service definitions. |
+| **9** | `argolis-cloudrun-iap-drift` | `antigravity-web-hub` (Cloud Run IAP) | Simulates Direct Cloud Run IAP `403 Forbidden` (missing `service-723040006558@gcp-sa-iap.iam.gserviceaccount.com` `roles/run.invoker`), `403 org_internal` OAuth mismatch, or `302 empty token`. | **Playbook 9 (`argolis-cloudrun-iap-recovery`)**: Restore IAP SA `roles/run.invoker` & custom OAuth client (`go/argolis-iam-rules`: zero `allUsers`/`@google.com`). | **Tier 2 (HITL + PAM JIT)**<br>Requires operator approval to modify Cloud Run IAM / IAP settings. |
+| **10** | `argolis-vertex-quota-spike` | Vertex AI Reasoning Engines (`europe-west1`) | Simulates Vertex AI `HTTP 429 RESOURCE_EXHAUSTED`, unprovisioned `404` (`gemini-3.7-flash`), or Gemini 3.x `400` missing `thoughtSignature`. | **Playbook 10 (`argolis-vertex-quota-failover`)**: Auto-failover to `gemini-2.5-flash` (`global` $\leftrightarrow$ `europe-west1`) & verify Model Armor `INSPECT_AND_BLOCK`. | **Tier 1 (Auto-Recovery)**<br>Pre-approved model/endpoint failover via A2A. |
+| **11** | `argolis-sharedvpc-logsink-lag` | Shared VPC `sb-prod-ew1-shared` & Sink `sre-gke-pam-telemetry-sink` | Simulates Shared VPC `roles/compute.networkUser` drift on `cs-host-78e19ed8055b4c6980cce9` and central log sink lag to `argodev-prod-audit-logs-0`. | **Playbook 11 (`argolis-sharedvpc-logsink-recovery`)**: Restore subnet `networkUser` bindings & grant sink `writerIdentity` `roles/bigquery.dataEditor` on `sre_releases`. | **Tier 2 (HITL + PAM JIT)**<br>Requires operator approval for cross-project IAM & sink reconciliation. |
 
 ---
 
@@ -134,66 +143,39 @@ NovaSRE provides 8 fully orchestrated scenarios spanning Kubernetes workloads, c
 
 NovaSRE balances execution speed with production safety through a strict 3-tier resolution hierarchy:
 
-```mermaid
-flowchart TD
-    Alert([🚨 Anomaly / Outage Alert]) --> Baseline[Baseline Triage: gcp-logging & gcp-monitoring]
-    Baseline --> Entrypoint[investigation-entrypoint: Domain Categorization]
-    
-    Entrypoint --> DomainCheck{Domain Specialist Analysis}
-    DomainCheck -->|Workloads| WorkloadDiag[gke-workloads / gcp-error-reporting]
-    DomainCheck -->|Networking| NetDiag[gke-networking / google-cloud-networking-observability]
-    DomainCheck -->|Latency & Traces| TraceDiag[gcp-trace / sre-correlation]
-    
-    WorkloadDiag & NetDiag & TraceDiag --> PlaybookCheck{Matches Known Playbook?}
-    
-    PlaybookCheck -->|Yes: Low Risk / High Confidence| Tier1[<b>Tier 1: Autonomous Auto-Recovery</b><br/>Instant A2A delegation to remediation_executor<br/>Zero human intervention]
-    PlaybookCheck -->|Yes: High Impact / State Modification| Tier2[<b>Tier 2: Gated HITL Approval</b><br/>Render Executive Resolution Card in Gemini Enterprise<br/>Awaiting Operator Approval]
-    
-    PlaybookCheck -->|No: Unscripted Anomaly| RAGCheck{Developer Knowledge Available?}
-    RAGCheck -->|Yes| Tier2RAG[<b>Tier 2: Dynamic RAG SOP</b><br/>Retrieve GCP Runbook & Propose Plan<br/>Awaiting Operator Approval]
-    RAGCheck -->|No| Tier3[<b>Tier 3: Autonomous LLM Fallback</b><br/>Zero-shot root cause reasoning from telemetry<br/>Formulate plan for HITL Review]
-    
-    Tier1 --> RemExec[remediation_executor executes OneMCP APIs]
-    Tier2 -->|Operator clicks Approve| RemExec
-    Tier2RAG -->|Operator clicks Approve| RemExec
-    Tier3 -->|Operator clicks Approve| RemExec
-    
-    RemExec --> PostMortem[Async Post-Mortem Compilation<br/>incident_report_writer archives to GCS]
-```
+1. **Tier 1: Autonomous Auto-Remediation (High Confidence / Low Risk — Playbooks 1, 2, 6, 10)**  
+   * **Trigger**: Root cause analysis precisely correlates with an established auto-recovery playbook (`gke-scale-recovery`, `gke-crashloop-rollback`, `gke-dns-recovery`, `argolis-vertex-quota-failover`).
+   * **Execution Flow**: `rca-telemetry-expert` loads the playbook and delegates directly to `remediation-executor` via A2A. Health is restored in seconds with zero operator intervention.
 
-1. **Tier 1: Autonomous Auto-Remediation (High Confidence / Low Risk)**  
-   * **Trigger**: Root cause analysis precisely correlates with an established auto-recovery playbook (e.g., zero-replica scale drops, CoreDNS capacity loss) or a verified bad rollout in the BigQuery deployment ledger.
-   * **Execution Flow**: `rca_telemetry_expert` loads the playbook and delegates directly to `remediation_executor` via A2A. Cluster health is restored in seconds with zero operator intervention.
+2. **Tier 2: Gated Human-in-the-Loop + PAM JIT Remediation (High Impact — Playbooks 3, 4, 5, 7, 8, 9, 11)**  
+   * **Trigger**: Root cause matches a playbook involving stateful disruption, database connection restarts, network policy deletion, capacity/cost scaling, Direct Cloud Run IAP IAM changes, or Shared VPC / Log Router sink bindings.
+   * **Execution Flow**: The agent prepares an **Executive Resolution Brief** and renders an **A2UI v0.8 approval widget** in Gemini Enterprise. Execution is held until an SRE reviews the evidence and clicks **`[ ✅ Approve & Execute ]`**, triggering PAM JIT elevation (`gke-editor`) with an immutable `[PAM_JUSTIFICATION]:` audit trail in `argodev-prod-audit-logs-0`.
 
-2. **Tier 2: Gated Human-in-the-Loop Remediation (High Impact / State Disruption)**  
-   * **Trigger**: Root cause matches a playbook involving stateful disruption, database connection restarts, network policy deletion, capacity/cost scaling, or dynamic RAG SOP retrieval.
-   * **Execution Flow**: The agent prepares an **Executive Resolution Brief** and renders an A2UI approval widget in Gemini Enterprise. Execution is held until an SRE reviews the evidence and clicks **`[ ✅ Approve & Execute ]`**.
-
-3. **Tier 3: Autonomous Zero-Shot LLM Fallback (Zero-Day & Novel Anomalies)**  
+3. **Tier 3: Autonomous Zero-Shot LLM Fallback (`gemini-3.1-pro-preview`)**  
    * **Trigger**: The anomaly does not match any pre-configured playbook or release ledger record.
-   * **Execution Flow**: `rca_telemetry_expert` leverages Gemini reasoning to progressively interrogate error logs (`LOGGING_MCP_SERVER`), inspect metrics (`MONITORING_MCP_SERVER`), analyze trace spans (`TRACE_MCP_SERVER`), and audit Kubernetes resource manifests (`GKE_MCP_SERVER`). It formulates an unscripted recovery hypothesis and presents it to the operator for HITL review.
+   * **Execution Flow**: `rca-telemetry-expert` escalates to `gemini-3.1-pro-preview` (`GEMINI_PRO_MODEL`) to synthesize a custom recovery plan from raw telemetry and presents it for Tier 2 HITL review.
 
 ---
 
-## 📚 4. Modular 4-Layer Skill Architecture (29 Skills)
+## 📚 4. Modular 4-Layer Skill Architecture (35 Skills)
 
-NovaSRE is powered by 29 modular skills organized into 4 functional layers:
+NovaSRE is powered by **35 modular skills** organized into 4 functional layers and synced to `gs://antigravity-web-hub-argolis-sre-playbooks/playbooks/`:
 
-```
+```text
 app/skills/
 ├── diagnostics/                                # Layer 1: Specialist Triage & Signal Skills (10 skills)
-│   ├── investigation-entrypoint/SKILL.md       # Generic incident orchestrator & domain router
-│   ├── sre-correlation/SKILL.md                # Cross-signal metric-log-trace & BigQuery pivot
+│   ├── investigation-entrypoint/SKILL.md       # Generic incident orchestrator & 11-scenario router
+│   ├── sre-correlation/SKILL.md                # Cross-signal & argodev-prod-audit-logs-0 BQ pivot
 │   ├── gke-workloads/SKILL.md                  # Pod lifecycle, CrashLoopBackOff, resource limits
 │   ├── gke-networking/SKILL.md                 # Dataplane V2, CoreDNS, ClusterIP service routing
-│   ├── gcp-logging/SKILL.md                    # Cloud Logging query design & timestamp extraction
+│   ├── gcp-logging/SKILL.md                    # Dual-project Cloud Logging queries & timestamp extraction
 │   ├── gcp-monitoring/SKILL.md                 # PromQL, timeseries alignment, alert inspection
 │   ├── gcp-trace/SKILL.md                      # Distributed trace breakdown & latency waterfall
 │   ├── gcp-error-reporting/SKILL.md            # Exception group stats & deduplicated stack traces
 │   ├── google-cloud-networking-observability/  # VPC flow logs, firewall rules, Cloud NAT SNAT
-│   └── google-cloud-global-frontend-config/    # Cloud Armor WAF, External ALBs, URL maps
+│   └── google-cloud-global-frontend-config/    # Cloud Armor WAF, Direct Cloud Run IAP, External ALBs
 │
-├── playbooks/                                  # Layer 2: Targeted SRE Recovery Playbooks (8 playbooks)
+├── playbooks/                                  # Layer 2: Targeted SRE Recovery Playbooks (11 playbooks)
 │   ├── gke-scale-recovery/SKILL.md             # Playbook 1: Deployment scale recovery (Tier 1)
 │   ├── gke-crashloop-rollback/SKILL.md         # Playbook 2: Bad rollout rollback via BQ (Tier 1)
 │   ├── gke-pod-restart/SKILL.md                # Playbook 3: Redis pod rolling restart (Tier 2)
@@ -201,9 +183,12 @@ app/skills/
 │   ├── gke-network-firewall-recovery/SKILL.md  # Playbook 5: NetworkPolicy unblock (Tier 2)
 │   ├── gke-dns-recovery/SKILL.md               # Playbook 6: CoreDNS capacity recovery (Tier 1)
 │   ├── gcp-nat-port-recovery/SKILL.md          # Playbook 7: Cloud NAT min-ports increase (Tier 2)
-│   └── gke-service-routing-recovery/SKILL.md   # Playbook 8: K8s Service selector restore (Tier 2)
+│   ├── gke-service-routing-recovery/SKILL.md   # Playbook 8: K8s Service selector restore (Tier 2)
+│   ├── argolis-cloudrun-iap-recovery/SKILL.md  # Playbook 9: Direct Cloud Run IAP & OAuth recovery (Tier 2)
+│   ├── argolis-vertex-quota-failover/SKILL.md  # Playbook 10: Vertex AI 429/404 failover & Model Armor (Tier 1)
+│   └── argolis-sharedvpc-logsink-recovery/     # Playbook 11: Shared VPC networkUser & Log Sink recovery (Tier 2)
 │
-├── simulations/                                # Layer 3: Chaos Engineering Playbooks (8 simulations)
+├── simulations/                                # Layer 3: Chaos Engineering Playbooks (11 simulations)
 │   ├── gke-scale-outage/SKILL.md               # Sim 1: Scale frontend deployment to 0
 │   ├── gke-bad-rollout/SKILL.md                # Sim 2: Invalidate cartservice image to broken-v2
 │   ├── gke-pod-crash/SKILL.md                  # Sim 3: Terminate redis-cart pods & lock memory
@@ -211,415 +196,102 @@ app/skills/
 │   ├── gke-network-firewall-block/SKILL.md     # Sim 5: Restrictive NetworkPolicy on checkout
 │   ├── gke-dns-outage/SKILL.md                 # Sim 6: Scale CoreDNS to 0 replicas
 │   ├── gcp-nat-port-drop/SKILL.md              # Sim 7: Cloud NAT SNAT port exhaustion
-│   └── gke-service-routing-break/SKILL.md      # Sim 8: Inject broken selector on checkout Service
+│   ├── gke-service-routing-break/SKILL.md      # Sim 8: Inject broken selector on checkout Service
+│   ├── argolis-cloudrun-iap-drift/SKILL.md     # Sim 9: Inject Direct Cloud Run IAP 403 drift
+│   ├── argolis-vertex-quota-spike/SKILL.md     # Sim 10: Trigger Vertex AI 429 & model routing alert
+│   └── argolis-sharedvpc-logsink-lag/SKILL.md  # Sim 11: Inject Shared VPC & central log sink lag alert
 │
 └── reporting/                                  # Layer 4: Post-Mortem & Incident Reporting (3 skills)
-    ├── postmortem-generator/SKILL.md           # Log-derived timeline builder & report generator
+    ├── postmortem-generator/SKILL.md           # Log-derived timeline builder + GCS & BQ archival
     ├── postmortem-documentation/SKILL.md       # Premium Markdown styling & executive structure
-    └── postmortem-aggregator/SKILL.md          # Multi-source diagnostic & A2A brief synthesis
+    └── postmortem-aggregator/SKILL.md          # Multi-source diagnostic & MTTD/MTTR synthesis
 ```
 
 ---
 
-## ⏱️ 5. Zero-Call Telemetry Timeline & Asynchronous Post-Mortems
+## ⏱️ 5. Zero-Call Telemetry Timeline & Dual GCS + BigQuery Post-Mortems
 
 To eliminate redundant API calls and prevent token bloat during post-incident documentation:
 
-1. **Structured SRE Fact Extraction**: During baseline triage, `rca_telemetry_expert` extracts `incident_start_time` (first log error / metric anomaly) and `detection_time`.
-2. **Verified Execution Timestamps**: When `remediation_executor` runs a fix, it records `mitigation_executed_time` and `recovery_verified_time`.
-3. **Zero-Call Synthesis**: These 4 verified timestamps are packaged into a structured JSON SRE fact block:
-   ```json
-   {
-     "alert": "CRITICAL ALERT: cartservice pod entering CrashLoopBackOff.",
-     "root_cause": "Recent release REL-042 pushed broken container image revision cartservice:broken-v2.",
-     "incident_start_time": "2026-08-07T20:12:04Z",
-     "detection_time": "2026-08-07T20:12:18Z",
-     "remediation_status": "SUCCESS",
-     "recommended_action": "ROLLBACK",
-     "target_resource": "deployments/cartservice",
-     "severity": "CRITICAL"
-   }
-   ```
-4. **Asynchronous Generation**: The UI spawns a non-blocking background thread for `incident_report_writer`. The report compiler builds the timeline table directly from session context—**making zero additional OneMCP telemetry calls**—and persists the final Markdown report to `gs://<bucket>/reports/post_mortem_<id>.md`.
+1. **Structured SRE Fact Extraction**: During baseline triage, `rca-telemetry-expert` extracts `incident_start_time` (first log error / metric anomaly) and `detection_time`.
+2. **Verified Execution Timestamps**: When `remediation-executor` runs a fix, it records `mitigation_executed_time`, `recovery_verified_time`, and `pam_grant_name`.
+3. **Dual Archival (`archive_postmortem_report`)**: `incident-report-writer` compiles the Markdown report from session context—**making zero additional OneMCP telemetry calls**—and:
+   - Archives the report to **`gs://antigravity-web-hub-argolis-telemetry/reports/post_mortem_<id>.md`**.
+   - Inserts a structured MTTD/MTTR row into **`argodev-prod-audit-logs-0.sre_releases.incident_postmortems`** (`europe-west1`).
 
 ---
 
-## 📦 6. BigQuery Deployment Ledger Correlation
+## 📦 6. Central BigQuery Deployment & Post-Mortem Ledger (`argodev-prod-audit-logs-0`)
 
-When container failures occur (`e.g., cartservice entering CrashLoopBackOff`), NovaSRE performs **Causal Deployment Correlation**:
+All release correlation and post-mortem analytics are stored in the Central Audit & Logging Hub **`argodev-prod-audit-logs-0`** (`cs-audit`, `europe-west1`, `PHYSICAL` storage billing):
 
-1. Queries the BigQuery deployment ledger via OneMCP (`BQ_MCP_SERVER`):
-   ```sql
-   SELECT release_id, service_name, container_image, git_commit, deployed_by, timestamp_utc
-   FROM `sre_releases.recent_releases`
-   WHERE service_name = 'cartservice'
-   ORDER BY timestamp_utc DESC
-   LIMIT 1;
-   ```
-2. Identifies that release **`REL-042`** deployed `cartservice:broken-v2` immediately prior to the anomaly.
-3. Automatically triggers **Playbook 2 (Tier 1 Rollback)** (`gke-crashloop-rollback`) to revert to the last stable release (`v1.0.4`) without manual guesswork.
+```sql
+-- 1. Causal Deployment Correlation (Clustered by service_name, namespace)
+SELECT release_id, service_name, namespace, revision, commit_sha, author_email, timestamp_utc, status
+FROM `argodev-prod-audit-logs-0.sre_releases.recent_releases`
+WHERE service_name = 'cartservice'
+ORDER BY timestamp_utc DESC
+LIMIT 1;
 
----
-
-## 🚀 7. Comprehensive Deployment Guide
-
-You can deploy NovaSRE to either a **new Google Cloud project** or an **existing project** using our modular Terraform suite (`terraform/`).
-
-* **⏱️ Estimated Deployment Time:** **`~10 to 12 minutes`** for a full stack deployment to a new project, or **`~6 to 8 minutes`** when deploying only the SRE agents to an existing project.
-
-### Prerequisites
-* Google Cloud CLI (`gcloud`) installed and authenticated (`gcloud auth login`).
-* Python `3.13+` and `terraform >= 1.5.0`.
-* A Google Cloud Billing Account ID (`gcloud billing accounts list`).
+-- 2. Historical Incident & MTTD/MTTR Analytics (Partitioned by DATE(incident_start_time))
+SELECT incident_id, severity, target_resource, mttd_seconds, mttr_seconds, pam_grant_name, report_gcs_uri
+FROM `argodev-prod-audit-logs-0.sre_releases.incident_postmortems`
+ORDER BY incident_start_time DESC
+LIMIT 10;
+```
 
 ---
 
-### Path A: Deploy to a New Google Cloud Project
-If starting fresh, create a new project and provision the full infrastructure (VPC, GKE Autopilot cluster, BigQuery database, and GCS bucket):
+## 🚀 7. Comprehensive Deployment Guide (`europe-west1`)
+
+### Configure Environment & Deploy to `antigravity-web-hub-argolis` (`europe-west1`)
 
 ```bash
-# 1. Create a new GCP project and link billing
-export GCP_PROJECT_ID="ksiri-novasre"
-export BILLING_ACCOUNT_ID="your-billing-account-id"
-export GCP_REGION="us-central1"
+export GCP_PROJECT_ID="antigravity-web-hub-argolis"
+export LOGGING_PROJECT_ID="argodev-prod-audit-logs-0"
+export GCP_REGION="europe-west1"
 
-gcloud projects create $GCP_PROJECT_ID
-gcloud billing projects link $GCP_PROJECT_ID --billing-account=$BILLING_ACCOUNT_ID
-
-# 2. Configure local environment variables
+# 1. Configure local .env
 cat <<EOF > .env
-GCP_PROJECT_ID="$GCP_PROJECT_ID"
-GOOGLE_CLOUD_LOCATION="$GCP_REGION"
-GEMINI_MODEL="gemini-3.7-flash"
+GCP_PROJECT_ID="antigravity-web-hub-argolis"
+LOGGING_PROJECT_ID="argodev-prod-audit-logs-0"
+GOOGLE_CLOUD_LOCATION="europe-west1"
+GKE_CLUSTER_NAME="online-boutique"
+GKE_CLUSTER_REGION="europe-west1"
+GEMINI_MODEL="gemini-2.5-flash"
+GEMINI_PRO_MODEL="gemini-3.1-pro-preview"
 EOF
 
-# 3. Initialize and apply Terraform (provisions VPC, GKE, BigQuery seed, and GCS Playbooks)
+# 2. Initialize and apply Terraform (provisions 4 SAs, PAM entitlement, BQ in argodev-prod-audit-logs-0, GCS, and GKE)
 cd terraform
 terraform init
-terraform apply -var="gcp_project_id=$GCP_PROJECT_ID" -var="gcp_region=$GCP_REGION" -var="deploy_infrastructure=true" -auto-approve
+terraform apply \
+  -var="gcp_project_id=$GCP_PROJECT_ID" \
+  -var="logging_project_id=$LOGGING_PROJECT_ID" \
+  -var="gcp_region=$GCP_REGION" \
+  -auto-approve
 
-# 4. Deploy Vertex AI Reasoning Engines (Investigator, Remediation, and Simulator)
+# 3. Deploy the 4 Vertex AI Reasoning Engines in europe-west1
 cd ..
 python3 deploy_a2a.py
 ```
 
-Once the agents are deployed, register them with Gemini Enterprise so operators can reach them (see [Post-Deployment: Register Agents with Gemini Enterprise](#post-deployment-register-agents-with-gemini-enterprise)).
+### Retrieve Deployed Reasoning Engine URNs
 
----
-
-### Path B: Deploy to an Existing Google Cloud Project
-If deploying into an existing project where VPC and GKE infrastructure are already running, disable infrastructure provisioning and deploy only the SRE agents:
+After `deploy_a2a.py` completes, live URNs are saved to `deployed_urns.json` and can also be queried directly:
 
 ```bash
-export GCP_PROJECT_ID="your-existing-project-id"
-export GCP_REGION="us-central1"
+export GCP_PROJECT_ID="antigravity-web-hub-argolis"
+export GCP_REGION="europe-west1"
+export GCP_PROJECT_NUM="723040006558"
 
-# 1. Apply Terraform with infrastructure creation disabled
-cd terraform
-terraform init
-terraform apply -var="gcp_project_id=$GCP_PROJECT_ID" -var="gcp_region=$GCP_REGION" -var="deploy_infrastructure=false" -auto-approve
-
-# 2. Deploy AI Agents
-cd ..
-python3 deploy_a2a.py
+cat deployed_urns.json
 ```
 
-Then register the agents with Gemini Enterprise (see [Post-Deployment: Register Agents with Gemini Enterprise](#post-deployment-register-agents-with-gemini-enterprise)).
-
----
-
-### Post-Deployment: Register Agents with Gemini Enterprise
-
-Operators interact with NovaSRE through **Gemini Enterprise**, which acts as the front door for chat, routing, and Human-in-the-Loop (HITL) approvals. After the Reasoning Engines are deployed, register the agents so they are discoverable and callable from Gemini Enterprise.
-
-> [!IMPORTANT]
-> Only **two** agents need to be registered with Gemini Enterprise: the **`outage-simulator`** and the **`rca-telemetry-expert`**. The `remediation-executor` and `incident-report-writer` are never called directly by an operator — they are invoked internally by the RCA agent over the Agent-to-Agent (A2A) protocol — so they are **not** registered.
->
-> 📖 For complete step-by-step registration instructions, console walk-throughs, and testing procedures, refer to the dedicated [**`register_agent.md`**](register_agent.md) guide.
-
-#### Step 0: Retrieve the numeric Reasoning Engine URNs & Parameters
-
-Gemini Enterprise (like all Vertex AI Reasoning Engine invocations) requires the **numerical resource URN** (e.g., `projects/1234567890/locations/us-central1/reasoningEngines/9876543210`) rather than the string display name. Extract the live URNs generated during deployment:
-
-```bash
-# Retrieve the project number and region
-export GCP_PROJECT_ID=$(gcloud config get-value project)
-export GCP_REGION=${GOOGLE_CLOUD_LOCATION:-"us-central1"}
-export GCP_PROJECT_NUM=$(gcloud projects describe "$GCP_PROJECT_ID" --format="value(projectNumber)")
-
-# Extract active numeric URNs from the Vertex AI Reasoning Engine registry
-export SIM_URN=$(curl -4 -s -H "Authorization: Bearer $(gcloud auth print-access-token)" "https://${GCP_REGION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_NUM}/locations/${GCP_REGION}/reasoningEngines" | grep -B 1 '"displayName": "outage-simulator"' | grep 'projects/' | grep -o 'projects/[^"]*')
-export RCA_URN=$(curl -4 -s -H "Authorization: Bearer $(gcloud auth print-access-token)" "https://${GCP_REGION}-aiplatform.googleapis.com/v1beta1/projects/${GCP_PROJECT_NUM}/locations/${GCP_REGION}/reasoningEngines" | grep -B 1 '"displayName": "rca-telemetry-expert"' | grep 'projects/' | grep -o 'projects/[^"]*')
-export RCA_A2A_URL="https://${GCP_REGION}-aiplatform.googleapis.com/v1beta1/${RCA_URN}/a2a"
-
-echo "Outage Simulator URN:         $SIM_URN"
-echo "RCA Telemetry Expert URN:     $RCA_URN"
-echo "RCA Telemetry Expert A2A URL: $RCA_A2A_URL"
-```
-
-##### Registration Components Matrix
-
-| Component | Description | Registration Location | Value / Format |
-| :--- | :--- | :--- | :--- |
-| **Outage Simulator URN** | Chaos Engine Reasoning Engine | Gemini Enterprise → Agent Runtime | `$SIM_URN` |
-| **RCA Agent A2A URL** | Diagnostician Protocol Endpoint | Gemini Enterprise → Agent-to-Agent Card (`url`) | `$RCA_A2A_URL` |
-| **OAuth Redirect URI** | Authorized Redirect for 3LO | Google Cloud Console → Credentials | `https://vertexaisearch.cloud.google.com/oauth-redirect` |
-| **Authorization URL** | Google OAuth Auth Endpoint | Gemini Enterprise → A2A Auth Section | `https://accounts.google.com/o/oauth2/auth?access_type=offline&prompt=consent` |
-| **Token URL** | Google OAuth Token Endpoint | Gemini Enterprise → A2A Auth Section | `https://oauth2.googleapis.com/token` |
-| **Scope** | Required Cloud Platform Scope | Gemini Enterprise → A2A Auth Section | `https://www.googleapis.com/auth/cloud-platform` |
-
-#### Step 1: Create a GCP OAuth web client (for 3LO)
-
-The RCA agent is registered as a custom A2A agent that authenticates on behalf of the operator using **three-legged OAuth (3LO)**. Create an **OAuth 2.0 Web application client** in the Google Cloud console (**APIs & Services → Credentials → Create Credentials → OAuth client ID → Web application**), set the **Authorized redirect URIs** to `https://vertexaisearch.cloud.google.com/oauth-redirect`, and record the generated **Client ID** and **Client Secret**.
-
-#### Step 2: Register the Outage Simulator (custom agent via Agent Runtime)
-
-Register the `outage-simulator` in Gemini Enterprise as a **custom agent via Agent Runtime**. It does **not** require any authorization details — supply only its numeric URN (`$SIM_URN`) and a brief description, for example:
-
-> *"NovaSRE Chaos Engine. Injects controlled failure modes (pod crashes, replica downscales, bad rollouts, DNS outages, NetworkPolicy isolation, Cloud NAT port drops, and broken service routing) into the `online-boutique` GKE cluster for demonstration and testing."*
-
-#### Step 3: Register the RCA Telemetry Expert (custom A2A agent)
-
-Register the `rca-telemetry-expert` in Gemini Enterprise as a **custom A2A agent**, providing the OAuth client credentials from Step 1 together with the Authorization URL, Token URL, and Scope from the table above.
-
-Use the agent card below, substituting `{GCP_REGION}`, `{GCP_PROJECT_NUM}`, and `{RCA_ENGINE_ID}` with the values from your `$RCA_URN`:
-
-```json
-{
-  "name": "rca-telemetry-expert",
-  "description": "The SRE RCA Telemetry Expert agent. Performs root-cause analysis, cross-correlates observability signals, and delegates GKE remediation under HITL gating.",
-  "version": "1.0",
-  "protocolVersion": "0.3.0",
-  "url": "https://{GCP_REGION}-aiplatform.googleapis.com/v1beta1/projects/{GCP_PROJECT_NUM}/locations/{GCP_REGION}/reasoningEngines/{RCA_ENGINE_ID}/a2a",
-  "capabilities": {
-    "streaming": true,
-    "extensions": [
-      {
-        "uri": "https://a2ui.org/a2a-extension/a2ui/v0.8",
-        "description": "Provides agent driven UI using the A2UI JSON format."
-      }
-    ]
-  },
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
-  "skills": [],
-  "preferredTransport": "HTTP+JSON"
-}
-```
-
-Once both agents are registered, operators can trigger simulations and autonomous investigations directly from the Gemini Enterprise console, and approve Tier 2 remediation via the A2UI HITL widgets rendered inline.
-
----
-
-## 🧪 8. How to Simulate Failures & Test
-
-You can verify and demonstrate the complete **NovaSRE** self-healing architecture either from the **Gemini Enterprise** console or directly via the terminal using the Vertex AI REST endpoints.
-
----
-
-### Option A: Test via Gemini Enterprise
-
-Once the `outage-simulator` and `rca-telemetry-expert` agents are registered (see §7), operators interact conversationally from the Gemini Enterprise console using `@` mentions.
-
-#### 🧠 Governance Tiers: Does Every Prompt Require Approval?
-
-**No, not every prompt requires approval!** NovaSRE enforces an autonomous two-tier governance model:
-
-* **⚡ Tier 1 (Auto-Recovery — Zero Approval Needed)**:
-  * **Scope**: Low-risk, stateless, or rollback-based recovery playbooks (Playbook 1: `gke-scale-recovery`, Playbook 2: `gke-crashloop-rollback`).
-  * **Behavior**: The RCA agent autonomously dispatches the healing command to `remediation-executor` over A2A and confirms recovery immediately.
-* **🛡️ Tier 2 (Gated HITL — Human Approval Required)**:
-  * **Scope**: Stateful disruption, capacity changes, network reconfigurations, DNS mutations, or novel uncategorized scenarios (Playbook 3: `gke-pod-restart`, Playbook 4: `gke-horizontal-upsize`, Playbook 5: `gke-service-routing-recovery`, Playbook 6: `gke-dns-recovery`, Playbook 7: `gke-network-firewall-recovery`, Playbook 8: `gcp-nat-port-recovery`, or general LLM reasoning fallback).
-  * **Behavior**: The RCA agent stops at the trust boundary, formulates a precise remediation plan, and renders an interactive **A2UI approval widget** inline with an **`[ ✅ Approve & Execute ]`** button. The action executes via Privileged Access Manager (PAM) JIT elevation *only after* the operator clicks Approve.
-
----
-
-#### 🧪 Complete Conversational Test Prompt Catalog
-
-##### Scenario 1: Frontend Scale Down (Tier 1 Auto-Recovery — No Approval Required)
-1. **Trigger Fault**:
-   ```text
-   @outage-simulator Run the gke-scale-outage simulation — scale the frontend deployment in namespace default to 0 replicas.
-   ```
-2. **Triage & Auto-Heal**:
-   ```text
-   @rca-telemetry-expert The online-boutique store is returning HTTP 503 errors. Investigate root cause and remediate.
-   ```
-   * *Expected Result*: Autonomous triage confirms 0 replicas; automatically delegates scale-up to `remediation-executor` via A2A without requesting approval; restores `frontend` to 1 replica.
-
----
-
-##### Scenario 2: Bad Container Rollout / CrashLoopBackOff (Tier 1 Auto-Recovery — No Approval Required)
-1. **Trigger Fault**:
-   ```text
-   @outage-simulator Run the gke-bad-rollout simulation on cartservice deployment in namespace default.
-   ```
-2. **Triage & Rollback**:
-   ```text
-   @rca-telemetry-expert Users report cart failures and errors when adding items. Triage the cluster and recover the service.
-   ```
-   * *Expected Result*: RCA detects `CrashLoopBackOff` or `ErrImagePull`, correlates with deployment ledger, and automatically rolls back `cartservice` to the last stable container image.
-
----
-
-##### Scenario 3: Database Lockup / Pod Restart (Tier 2 Gated HITL — Approval Required)
-1. **Trigger Fault**:
-   ```text
-   @outage-simulator Run the gke-pod-crash simulation on redis-cart in namespace default.
-   ```
-2. **Triage & Gated Approval**:
-   ```text
-   @rca-telemetry-expert The redis-cart cache is unresponsive. Investigate redis pod health and propose recovery.
-   ```
-   * *Expected Result*: RCA identifies the stale pod lock and renders an interactive **A2UI HITL Card** with an **`[ ✅ Approve & Execute ]`** button proposing `restart deployment redis-cart`. Clicking Approve triggers JIT execution.
-
----
-
-##### Scenario 4: Payment Latency & Capacity Bottleneck (Tier 2 Gated HITL — Approval Required)
-1. **Trigger Fault**:
-   ```text
-   @outage-simulator Run the gke-payment-latency simulation on paymentservice in namespace default.
-   ```
-2. **Triage & Gated Approval**:
-   ```text
-   @rca-telemetry-expert Checkout transactions are timing out (>2000ms latency). Triage paymentservice and scale if needed.
-   ```
-   * *Expected Result*: RCA detects high latency and prompts with an **A2UI Approval Card** proposing horizontal autoscaling to 3 replicas.
-
----
-
-##### Scenario 5: Service Routing / Broken Selector (Tier 2 Gated HITL — Approval Required)
-1. **Trigger Fault**:
-   ```text
-   @outage-simulator Run the gke-service-routing-break simulation on frontend service in namespace default.
-   ```
-2. **Triage & Gated Approval**:
-   ```text
-   @rca-telemetry-expert The frontend service is not routing traffic to any endpoints. Investigate the Kubernetes service selector.
-   ```
-   * *Expected Result*: RCA diagnoses the selector mismatch (`app=broken-selector`), and generates an **A2UI Approval Card** to restore the correct selector (`app=frontend`).
-
----
-
-##### Scenario 6: CoreDNS Cluster Outage (Tier 2 Gated HITL — Approval Required)
-1. **Trigger Fault**:
-   ```text
-   @outage-simulator Run the gke-dns-outage simulation on coredns in namespace kube-system.
-   ```
-2. **Triage & Gated Approval**:
-   ```text
-   @rca-telemetry-expert Services are failing to resolve cluster domain names. Investigate CoreDNS and restore DNS resolution.
-   ```
-   * *Expected Result*: RCA identifies CoreDNS downscale to 0 replicas, presenting an **A2UI Approval Card** to restore CoreDNS to 2 replicas.
-
----
-
-### Option B: Test via the Terminal (Direct cURL & REST API Verification)
-
-You can run an end-to-end verification directly from your terminal (`bash`) by querying the serverless Vertex AI Reasoning Engine REST endpoints (`:streamQuery`) using `curl` and your Google Cloud OAuth token. This simulates a complete **Tier 1 Scale Outage (`gke-scale-outage`)** and verifies autonomous self-healing via Agent-to-Agent (`A2A`) delegation.
-
-#### 1. Verify Initial GKE Cluster State
-Ensure the target microservice (`frontend`) is active (`1/1` replicas) before starting:
-```bash
-kubectl get deployment frontend -n default
-```
-*Expected Output:*
-```text
-NAME       READY   UP-TO-DATE   AVAILABLE   AGE
-frontend   1/1     1            1           11h
-```
-
-#### 2. Trigger the Outage via `outage-simulator` using `curl`
-Execute the following `curl` command to call the remote `outage-simulator` Reasoning Engine (`4620976341926281216`). This instructs the Chaos Engine over HTTP/JSON to load the `gke-scale-outage` skill and scale `frontend` to 0 replicas over A2A:
-```bash
-curl -s -X POST \
-  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  -H "Content-Type: application/json" \
-  "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/1047367951597/locations/us-central1/reasoningEngines/4620976341926281216:streamQuery" \
-  -d '{
-    "input": {
-      "user_id": "sre",
-      "message": {
-        "role": "user",
-        "parts": [{"text": "Load the gke-scale-outage skill and execute the Tier 1 outage simulation right now. Scale deployment frontend in namespace default in cluster online-boutique in region us-central1 to 0 replicas."}]
-      }
-    },
-    "classMethod": "stream_query"
-  }'
-```
-*Expected Streamed Response Confirmation:*
-```text
-OUTAGE SIMULATION SUCCESSFUL: GKE Deployment 'frontend' has been scaled to 0 active replicas. Alert condition triggered.
-```
-
-#### 3. Confirm Outage State in GKE
-Verify via `kubectl` that the active pods have dropped to `0`:
-```bash
-kubectl get deployment frontend -n default
-```
-*Expected Output:*
-```text
-NAME       READY   UP-TO-DATE   AVAILABLE   AGE
-frontend   0/0     0            0           11h
-```
-
-#### 4. Trigger Autonomous Investigation & Self-Healing via `rca-telemetry-expert` using `curl`
-Now call the remote `rca-telemetry-expert` Reasoning Engine (`6684750871168811008`) using `curl` without passing a pre-created `session_id` (allowing the receiving serverless container pod to auto-create its local session in memory on demand). The agent queries GKE via MCP tools, diagnoses `replicas: 0`, and autonomously delegates across A2A (`remediation_executor_remote`) to restore the service:
-```bash
-curl -s -X POST \
-  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  -H "Content-Type: application/json" \
-  "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/1047367951597/locations/us-central1/reasoningEngines/6684750871168811008:streamQuery" \
-  -d '{
-    "input": {
-      "user_id": "sre",
-      "message": {
-        "role": "user",
-        "parts": [{"text": "CRITICAL ALERT: frontend service active replicas = 0. HTTP 503 errors detected across online-boutique. Investigate the root cause immediately and delegate autonomous self-healing remediation over A2A (`remediation_executor_remote`) to scale the frontend deployment in namespace default to 1 replica right now."}]
-      }
-    },
-    "classMethod": "stream_query"
-  }'
-```
-*Expected Streamed Response Confirmation:*
-```json
-{
-  "alert": "CRITICAL ALERT: frontend service active replicas = 0. HTTP 503 errors detected across online-boutique.",
-  "root_cause": "The root cause appears to be that the `frontend` deployment was scaled down to 0 replicas, causing the service to be unavailable and return HTTP 503 errors.",
-  "remediation_status": "SUCCESS",
-  "recommended_action": "SCALE_UP",
-  "target_resource": "deployments/frontend",
-  "severity": "CRITICAL"
-}
-```
-
-#### 5. Verify Full System Recovery in Terminal
-Run a final terminal check to confirm that the `frontend` microservice has been scaled back up and is `Ready: 1/1`:
-```bash
-kubectl get deployment frontend -n default
-```
-*Expected Output:*
-```text
-NAME       READY   UP-TO-DATE   AVAILABLE   AGE
-frontend   1/1     1            1           11h
-```
-
----
-
-## 🛠️ 9. Extensibility: How to Expand the Platform for New Issues
-
-Because NovaSRE is built upon **Modular Markdown Skills (`SKILL.md`)** and the **Model Context Protocol (MCP)**, expanding the platform to simulate, triage, and remediate brand-new failure scenarios is completely decoupled from core agent code. You do not need to retrain models or modify core Python orchestration logic.
-
-To add a new autonomous capability, complete three lightweight steps:
-
-1. **Author a Chaos Simulation Skill**: Create a new folder under `app/skills/simulations/<your-new-scenario>/SKILL.md`. Document the exact failure injection routine in readable GitHub Flavored Markdown (e.g., injecting CPU saturation, editing resource limits, or introducing network loss via `kubectl`).
-2. **Author a Remediation Playbook**: Create the corresponding diagnostic SOP under `app/skills/playbooks/<your-new-scenario>/SKILL.md`. Document the target symptoms, causal telemetry indicators, and exact recovery commands (`kubectl`, `gcloud`, etc.). When you run `terraform apply`, this playbook is automatically seeded into your central Google Cloud Storage repository (`GCS_MCP_SERVER`).
-3. **Assign a Governance Tier**: Reference the new scenario ID in the corresponding SRE Playbook and assign its operational governance policy (Tier 1 for immediate Auto-Remediation or Tier 2 for gated HITL confirmation). Operators invoke the scenario by name through the `outage-simulator` and `rca-telemetry-expert` agents in Gemini Enterprise — no UI changes are required.
-
-Once updated, the Vertex AI Reasoning Engines automatically discover, parse, and orchestrate your new skills on demand via their conversational MCP server attachments.
+See [**`register_agent.md`**](register_agent.md) for complete Gemini Enterprise registration steps and [**`docs/ARGOLIS_SRE_PLAYBOOKS_RUNBOOK.md`**](docs/ARGOLIS_SRE_PLAYBOOKS_RUNBOOK.md) for all 11 scenario test commands.
 
 ---
 
 ## 📄 License
-Copyright (c) 2026 siri2421. All rights reserved.
+Copyright (c) 2026 siri2421 & Google Cloud GTM Engineering. All rights reserved.
 Licensed under the Apache-2.0 License.

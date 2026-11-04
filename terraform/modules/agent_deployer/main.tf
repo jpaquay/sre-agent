@@ -17,8 +17,13 @@ resource "terraform_data" "run_python_deployer" {
 
   triggers_replace = [
     var.gcp_project_id,
+    var.logging_project_id,
     var.gemini_model,
-    var.service_account_email
+    var.service_account_email,
+    var.investigator_sa_email,
+    var.remediator_sa_email,
+    var.reporter_sa_email,
+    var.simulator_sa_email
   ]
 
   provisioner "local-exec" {
@@ -26,13 +31,18 @@ resource "terraform_data" "run_python_deployer" {
       set -e
       export PATH=$HOME/google-cloud-sdk/bin:$HOME/.local/bin:$PATH:/google/google-cloud-sdk/bin:/usr/lib/google-cloud-sdk/bin:/opt/google-cloud-sdk/bin:/usr/local/google-cloud-sdk/bin:/root/google-cloud-sdk/bin:/usr/local/bin:/usr/bin:/bin
       export GCP_PROJECT_ID=${var.gcp_project_id}
+      export LOGGING_PROJECT_ID=${var.logging_project_id}
       export GOOGLE_CLOUD_LOCATION=${var.gcp_region}
       export STAGING_BUCKET=gs://${var.staging_bucket_name}
       export REASONING_ENGINE_SERVICE_ACCOUNT=${var.service_account_email}
+      export INVESTIGATOR_SERVICE_ACCOUNT=${var.investigator_sa_email}
+      export REMEDIATOR_SERVICE_ACCOUNT=${var.remediator_sa_email}
+      export REPORTER_SERVICE_ACCOUNT=${var.reporter_sa_email}
+      export SIMULATOR_SERVICE_ACCOUNT=${var.simulator_sa_email}
       export GEMINI_MODEL=${var.gemini_model}
 
       echo "🚀 Launching automated build & deployment to Vertex AI Reasoning Engine..."
-      echo "Target Project: $GCP_PROJECT_ID | Region: $GOOGLE_CLOUD_LOCATION | SA: $REASONING_ENGINE_SERVICE_ACCOUNT"
+      echo "Target Project: $GCP_PROJECT_ID | Audit Hub: $LOGGING_PROJECT_ID | Region: $GOOGLE_CLOUD_LOCATION"
 
       PYTHON_CMD=$(command -v python3 || find / -name python3 -type f 2>/dev/null | head -n 1)
       if [ -f "${abspath(path.root)}/../.venv/bin/python3" ]; then

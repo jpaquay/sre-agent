@@ -1,0 +1,29 @@
+{
+  "project_id": "antigravity-web-hub-argolis",
+  "project_number": "723040006558",
+  "logging_project_id": "argodev-prod-audit-logs-0",
+  "location": "europe-west1",
+  "gemini_model": "gemini-2.5-flash",
+  "gemini_pro_model": "gemini-3.1-pro-preview",
+  "gke_cluster_name": "online-boutique",
+  "gke_cluster_region": "europe-west1",
+  "rca-telemetry-expert": "projects/723040006558/locations/europe-west1/reasoningEngines/6091114097972084736",
+  "remediation-executor": "projects/723040006558/locations/europe-west1/reasoningEngines/8752741477748047872",
+  "outage-simulator": "projects/723040006558/locations/europe-west1/reasoningEngines/8757245077375418368",
+  "incident-report-writer": "projects/723040006558/locations/europe-west1/reasoningEngines/398564168975777792",
+  "NOVASRE_RCA_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/6091114097972084736",
+  "NOVASRE_REMEDIATOR_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/8752741477748047872",
+  "NOVASRE_SIMULATOR_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/8757245077375418368",
+  "NOVASRE_REPORTER_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/398564168975777792",
+  "INVESTIGATOR_AGENT_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/6091114097972084736",
+  "REMEDIATION_AGENT_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/8752741477748047872",
+  "OUTAGE_SIMULATOR_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/8757245077375418368",
+  "INCIDENT_REPORT_WRITER_URN": "projects/723040006558/locations/europe-west1/reasoningEngines/398564168975777792",
+  "service_accounts": {
+    "rca-telemetry-expert": "sre-investigator-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com",
+    "remediation-executor": "sre-remediator-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com",
+    "incident-report-writer": "sre-reporter-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com",
+    "outage-simulator": "sre-simulator-sa@antigravity-web-hub-argolis.iam.gserviceaccount.com"
+  },
+  "deployed_at": "2026-10-05T22:50:53Z"
+}

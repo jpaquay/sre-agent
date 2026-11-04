@@ -11,10 +11,22 @@ from fastapi import FastAPI, HTTPException
 from google.genai import types
 from google.adk.runners import InMemoryRunner
 
-# Import our ADK Agents
-from app.investigator_agent import rca_telemetry_expert, incident_report_writer
+# Import our ADK Agents and Enterprise Argolis Config
+from app.investigator_agent import (
+    rca_telemetry_expert,
+    incident_report_writer,
+    archive_postmortem_report,
+)
 from app.remediation_agent import remediation_executor
-from app.config import PROJECT_ID
+from app.config import (
+    PROJECT_ID,
+    LOGGING_PROJECT_ID,
+    GEMINI_LOCATION,
+    GKE_CLUSTER_NAME,
+    GKE_CLUSTER_REGION,
+    BQ_POSTMORTEMS_TABLE,
+    screen_prompt_with_model_armor,
+)
 
 # ==========================================
 # 1. CENTRALIZED HITL SESSION STORE & FASTAPI
@@ -91,9 +103,18 @@ async def run_sre_pipeline(alert_payload: str):
     session_id = str(uuid.uuid4())
     print("=" * 75)
     print(f"STARTING SRE SUPERVISOR SESSION: {session_id}")
-    print(f"Incoming Alert: '{alert_payload}'")
-    print(f"Target Project:  '{PROJECT_ID}'")
+    print(f"Incoming Alert:       '{alert_payload}'")
+    print(f"Runtime Host Project: '{PROJECT_ID}' ({GKE_CLUSTER_REGION})")
+    print(f"Central Audit Hub:    '{LOGGING_PROJECT_ID}' ({BQ_POSTMORTEMS_TABLE})")
     print("=" * 75)
+
+    # -------------------------------------------------------------------------
+    # STEP 0: MODEL ARMOR & PROMPT-INJECTION GUARD
+    # -------------------------------------------------------------------------
+    is_safe, reason = screen_prompt_with_model_armor(alert_payload)
+    if not is_safe:
+        log_step("ModelArmor", f"CRITICAL: Inbound alert blocked by security policy: {reason}", "31")
+        return
 
     # -------------------------------------------------------------------------
     # STEP 1: TELEMETRY DIAGNOSTICS & CONDITIONAL ROUTING
@@ -103,16 +124,15 @@ async def run_sre_pipeline(alert_payload: str):
     log_step("Supervisor", "Routing alert to rca_telemetry_expert for investigation and domain skill delegation...", "36")
     
     rca_prompt = f"""
-    Investigate this GKE/GCP alert in project {PROJECT_ID}:
+    Investigate this GKE/GCP alert in runtime project {PROJECT_ID} (cluster {GKE_CLUSTER_NAME} in {GKE_CLUSTER_REGION}) and central audit hub {LOGGING_PROJECT_ID}:
     '{alert_payload}'
     
-    Query your logging, monitoring, tracing, and network tools, find the root cause, and return your SRE JSON facts packet.
+    Query your logging, monitoring, tracing, network, and central audit/release ledger tools, find the root cause, and return your SRE JSON facts packet.
     """
     
     # Run the diagnostician and wait for results
     rca_response = await run_agent_locally(target_agent, rca_prompt, f"rca-{session_id}")
 
-    
     # Parse the structured SRE facts packet
     try:
         import re
@@ -120,16 +140,13 @@ async def run_sre_pipeline(alert_payload: str):
         if json_match:
             cleaned_response = json_match.group(1)
         else:
-            cleaned_response = rca_response.strip()
-            if cleaned_response.startswith("```json"):
-                cleaned_response = cleaned_response[7:]
-            if cleaned_response.endswith("```"):
-                cleaned_response = cleaned_response[:-3]
+            brace_match = re.search(r"(\{[\s\S]*\"remediation_status\"[\s\S]*\})", rca_response)
+            cleaned_response = brace_match.group(1) if brace_match else rca_response.strip()
         cleaned_response = cleaned_response.strip()
         
         rca_data = json.loads(cleaned_response)
         log_step(agent_name, f"Diagnostics complete. Isolated root cause:\n{json.dumps(rca_data, indent=2)}", "35")
-    except Exception as e:
+    except Exception:
         log_step("Supervisor", f"CRITICAL: Failed to parse RCA Agent response as JSON. Raw response:\n{rca_response}", "31")
         return
 
@@ -138,6 +155,9 @@ async def run_sre_pipeline(alert_payload: str):
     action = rca_data.get("recommended_action", "NONE").upper()
     resource = rca_data.get("target_resource", "")
     root_cause = rca_data.get("root_cause", "")
+    severity = rca_data.get("severity", "CRITICAL")
+    incident_start_time = rca_data.get("incident_start_time", "")
+    detection_time = rca_data.get("detection_time", "")
 
     if action == "NONE":
         log_step("Supervisor", "No mutating action recommended. Skipping remediation. Incident Closed.", "32")
@@ -154,7 +174,6 @@ async def run_sre_pipeline(alert_payload: str):
         # -------------------------------------------------------------------------
         log_step("Supervisor", f"CRITICAL: Mutating action '{action}' recommended on resource: {resource}", "31")
         
-        # Register the session in our local store
         session_store[session_id] = {
             "status": "AWAITING_APPROVAL",
             "action": action,
@@ -163,15 +182,14 @@ async def run_sre_pipeline(alert_payload: str):
         }
 
         print(f"\n\033[1;31m>>> 🚨 HUMAN-IN-THE-LOOP SAFETY GATE ACTIVE 🚨 <<<\033[0m")
-        print(f"The SRE Supervisor has paused execution to prevent unauthorized infrastructure modification.")
-        print(f"To APPROVE this remediation, execute:")
+        print("The SRE Supervisor has paused execution to prevent unauthorized infrastructure modification.")
+        print("To APPROVE this remediation, execute:")
         print(f"   \033[1;32mcurl -X POST 'http://127.0.0.1:8000/callback/{session_id}?decision=APPROVED'\033[0m")
-        print(f"To REJECT this remediation, execute:")
+        print("To REJECT this remediation, execute:")
         print(f"   \033[1;31mcurl -X POST 'http://127.0.0.1:8000/callback/{session_id}?decision=REJECTED'\033[0m\n")
 
         log_step("Supervisor", "Suspending execution. Awaiting operator callback...", "31")
         
-        # Polling loop waiting for the FastAPI background thread to receive the operator decision
         decision = None
         while True:
             status = session_store[session_id]["status"]
@@ -191,7 +209,7 @@ async def run_sre_pipeline(alert_payload: str):
             return
 
         # -------------------------------------------------------------------------
-        # STEP 3: SECURE REMEDIATION (remediation_executor - A2A SIMULATION)
+        # STEP 3: SECURE REMEDIATION (remediation_executor - A2A + PAM JIT)
         # -------------------------------------------------------------------------
         log_step("Supervisor", "Remediation APPROVED. Invoking remediation_executor via secure A2A...", "36")
         
@@ -201,31 +219,48 @@ async def run_sre_pipeline(alert_payload: str):
         - Target Resource: {resource}
         - Root Cause: {root_cause}
         
-        Please execute this action using your GKE tools, verify GKE pod recovery, and return your execution outcomes.
+        Please execute this action using your GKE/Compute tools in project {PROJECT_ID} ({GKE_CLUSTER_REGION}), verify recovery, and return your execution outcomes.
+        [PAM_JUSTIFICATION]: Operator approved HITL remediation for session {session_id} on {resource}.
         """
         
         remediation_response = await run_agent_locally(remediation_executor, remediation_prompt, f"rem-{session_id}")
         log_step("remediation_executor", f"Remediation and validation cycle complete:\n{remediation_response}", "32")
 
     # -------------------------------------------------------------------------
-    # STEP 4: INCIDENT REPORTING (incident_report_writer - SUBAGENT COLLABORATION)
+    # STEP 4: INCIDENT REPORTING (incident_report_writer + GCS & BigQuery Archival)
     # -------------------------------------------------------------------------
     log_step("Supervisor", "Invoking incident_report_writer as reporting subagent...", "36")
     
     reporting_prompt = f"""
-    An incident occurred and has been successfully remediated. Please compile the post-mortem report and archive it to GCS.
+    An incident occurred in {PROJECT_ID} ({GKE_CLUSTER_REGION}) and has been successfully remediated.
+    Please compile the post-mortem report and archive it to GCS and BigQuery ({BQ_POSTMORTEMS_TABLE}) using `archive_postmortem_report`.
     
     **Incident Details:**
     - Alert: {alert_payload}
     - Root Cause: {root_cause}
     - Action Executed: {action} on {resource}
+    - Severity: {severity}
+    - Incident Start Time: {incident_start_time}
+    - Detection Time: {detection_time}
     - Execution Outcomes: {remediation_response}
     
-    Write the Markdown report and save it to GCS.
+    Write the Markdown report and call `archive_postmortem_report`.
     """
     
     reporting_response = await run_agent_locally(incident_report_writer, reporting_prompt, f"rep-{session_id}")
-    log_step("incident_report_writer", f"Post-mortem report compiled and archived:\n{reporting_response}", "33")
+    # Ensure deterministic archival to GCS & BigQuery even if the LLM only returned Markdown
+    archival_summary = archive_postmortem_report(
+        report_markdown=reporting_response,
+        alert=alert_payload,
+        root_cause=root_cause,
+        incident_start_time=incident_start_time,
+        detection_time=detection_time,
+        remediation_status="SUCCESS",
+        recommended_action=action,
+        target_resource=resource,
+        severity=severity,
+    )
+    log_step("incident_report_writer", f"Post-mortem report compiled and archived:\n{reporting_response}\nArchival Receipt:\n{archival_summary}", "33")
 
     print("=" * 75)
     print("SRE SUPERVISOR SESSION COMPLETED SUCCESSFULLY.")
@@ -247,7 +282,7 @@ def main():
     # 1. Start the FastAPI HITL server in a background thread
     server_thread = threading.Thread(target=start_hitl_server, daemon=True)
     server_thread.start()
-    time.sleep(1.0) # Allow server to bind
+    time.sleep(1.0)  # Allow server to bind
 
     # 2. Run the async orchestration pipeline
     asyncio.run(run_sre_pipeline(args.alert))

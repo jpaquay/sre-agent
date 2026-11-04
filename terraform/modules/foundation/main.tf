@@ -74,7 +74,7 @@ resource "terraform_data" "enable_onemcp_servers" {
       GCLOUD_CMD=$(command -v gcloud || find / -name gcloud -type f 2>/dev/null | head -n 1)
       if [ -n "$GCLOUD_CMD" ] && [ -f "$GCLOUD_CMD" ]; then
         echo "Enabling OneMCP servers on project ${var.gcp_project_id}..."
-        for service in logging.googleapis.com monitoring.googleapis.com container.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com; do
+        for service in logging.googleapis.com monitoring.googleapis.com container.googleapis.com run.googleapis.com cloudresourcemanager.googleapis.com bigquery.googleapis.com storage.googleapis.com compute.googleapis.com cloudtrace.googleapis.com clouderrorreporting.googleapis.com; do
           $GCLOUD_CMD beta services mcp enable $service --project=${var.gcp_project_id} --quiet || true
         done
       fi

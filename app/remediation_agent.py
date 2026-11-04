@@ -22,7 +22,12 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from app.config import (
     PROJECT_ID,
+    PROJECT_NUMBER,
+    LOGGING_PROJECT_ID,
+    SHARED_VPC_HOST_PROJECT,
     GEMINI_MODEL,
+    GEMINI_PRO_MODEL,
+    GEMINI_LOCATION,
     GlobalGemini,
     GKE_CLUSTER_NAME,
     GKE_CLUSTER_REGION,
@@ -30,32 +35,28 @@ from app.config import (
     COMPUTE_MCP_SERVER,
     get_mcp_toolset,
     LazyToolset,
-    GlobalGemini,
     PAM_ENABLED,
     PAM_ENTITLEMENT_NAME,
     PAM_GRANT_DURATION_SECONDS,
     PAM_GRANT_ACTIVE_TIMEOUT_SECONDS,
+    screen_prompt_with_model_armor,
 )
 
 # =========================================================================
-# PAM JIT ELEVATION (before_agent_callback)
+# PAM JIT ELEVATION & MODEL ARMOR GUARD (before_agent_callback)
 # =========================================================================
-# Before the remediator touches GKE/GCP, it requests a temporary PAM grant so the
-# privileged access is JIT and auditable. The operator's justification arrives in-band
-# as a `[PAM_JUSTIFICATION]:` trailer on the request text (forwarded by the RCA agent);
-# if absent we synthesize a Tier-1 default (D6) so the audit trail is never empty.
-#
-# The PAM grant elevates the identity that CALLS create_grant — which is this remediator's
-# own service account (the entitlement's sole eligibleUser) — so the call MUST run here.
-#
-# Per D3, standing roles/container.developer is retained for now, so PAM is additive/
-# audit-only: a grant failure is logged loudly but does NOT block healing. Once the
-# standing role is removed (in Terraform), this becomes the hard gate.
 _PAM_JUSTIFICATION_MARKER = "[PAM_JUSTIFICATION]:"
 _PAM_TIER1_DEFAULT = (
     "Automated SRE remediation initiated by remediation_executor; no operator justification "
     "was supplied. JIT elevation requested to execute an approved healing action."
 )
+
+# Track most recent PAM grant status for downstream post-mortem archival in argodev-prod-audit-logs-0
+LAST_PAM_GRANT_INFO = {
+    "grant_name": "standing-role-d3-audit",
+    "state": "NOT_REQUESTED",
+    "entitlement": PAM_ENTITLEMENT_NAME,
+}
 
 def _extract_pam_justification(content) -> str:
     """Pull the operator justification out of the inbound request's [PAM_JUSTIFICATION]: trailer."""
@@ -78,8 +79,8 @@ def _extract_pam_justification(content) -> str:
             return blob[idx + len(_PAM_JUSTIFICATION_MARKER):].strip()
     return ""
 
-def _request_pam_grant_sync(justification: str, logger) -> None:
-    """Create a JIT PAM grant and poll until ACTIVE. Blocking; run via asyncio.to_thread."""
+def _request_pam_grant_sync(justification: str, logger) -> dict:
+    """Create a JIT PAM grant, poll until ACTIVE, and return grant metadata for BigQuery audit archival."""
     import time
     from google.cloud import privilegedaccessmanager_v1 as pam
 
@@ -105,31 +106,82 @@ def _request_pam_grant_sync(justification: str, logger) -> None:
         time.sleep(2)
         state = client.get_grant(name=name).state
     if state == pam.Grant.State.ACTIVE:
-        logger.info("[pam] ✅ JIT grant ACTIVE: %s", name)
+        logger.info("[pam] ✅ JIT grant ACTIVE: %s (logged to %s)", name, LOGGING_PROJECT_ID)
     else:
         logger.warning(
             "[pam] ⚠️ grant %s did not reach ACTIVE (state=%s); proceeding on standing role (D3)",
             name, state.name,
         )
+    grant_info = {
+        "grant_name": name,
+        "state": state.name,
+        "entitlement": PAM_ENTITLEMENT_NAME,
+        "justification": justification[:500],
+        "audit_hub_project": LOGGING_PROJECT_ID,
+    }
+    LAST_PAM_GRANT_INFO.update(grant_info)
+    os.environ["LAST_PAM_GRANT_NAME"] = str(name)
+    return grant_info
 
 async def _pam_grant_callback(callback_context):
-    """before_agent_callback: obtain a JIT PAM grant before the remediator executes.
+    """before_agent_callback: screen inbound remediation request with Model Armor and obtain a JIT PAM grant.
 
-    Non-blocking on failure (D3): logs and returns None so healing proceeds on the
-    standing role. Returns None always — never short-circuits the agent.
+    Records the PAM grant resource name and status in `callback_context.state["pam_grant_name"]`
+    and `os.environ["LAST_PAM_GRANT_NAME"]` so it can be persisted into
+    `argodev-prod-audit-logs-0.sre_releases.incident_postmortems`.
     """
     import asyncio
     import logging
+    from google.genai import types as genai_types
     logger = logging.getLogger("google_adk")
 
+    # 1. Screen inbound remediation request with Model Armor guard (text + inline_data parts)
+    if callback_context.user_content and getattr(callback_context.user_content, "parts", None):
+        text_fragments = []
+        for p in callback_context.user_content.parts:
+            if getattr(p, "text", None):
+                text_fragments.append(p.text)
+            inline = getattr(p, "inline_data", None)
+            if inline is not None and getattr(inline, "data", None):
+                data = inline.data
+                text_fragments.append(
+                    data.decode("utf-8", errors="ignore") if isinstance(data, (bytes, bytearray)) else str(data)
+                )
+        combined_text = "\n".join(text_fragments)
+        is_safe, reason = screen_prompt_with_model_armor(combined_text)
+        if not is_safe:
+            logger.warning("[model_armor] Blocked remediation request in _pam_grant_callback: %s", reason)
+            return genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text=f"🛡️ Remediation Blocked by Model Armor: {reason}")]
+            )
+
     if not PAM_ENABLED:
+        callback_context.state["pam_grant_name"] = "pam-disabled"
+        callback_context.state["pam_grant_status"] = "DISABLED"
         return None
 
     justification = _extract_pam_justification(callback_context.user_content) or _PAM_TIER1_DEFAULT
     try:
-        await asyncio.to_thread(_request_pam_grant_sync, justification, logger)
+        grant_info = await asyncio.to_thread(_request_pam_grant_sync, justification, logger)
+        grant_name = grant_info.get("grant_name", "")
+        grant_state = str(grant_info.get("state", "")).upper()
+        callback_context.state["pam_grant_name"] = grant_name
+        callback_context.state["pam_grant_status"] = grant_state
+        if not grant_name or grant_state not in ("ACTIVE", "APPROVED", "GRANTED"):
+            logger.error("[pam] ❌ JIT grant unauthorized state=%r grant=%r; failing closed", grant_state, grant_name)
+            return genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text=f"🛑 Remediation Aborted (PAM Fail-Closed): JIT grant state {grant_state!r} is not authorized.")]
+            )
     except Exception as e:
-        logger.warning("[pam] ⚠️ JIT grant request failed: %s; proceeding on standing role (D3)", e)
+        callback_context.state["pam_grant_name"] = ""
+        callback_context.state["pam_grant_status"] = f"FAILED_CLOSED: {e}"
+        logger.error("[pam] ❌ JIT grant request failed: %s; failing closed", e)
+        return genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text=f"🛑 Remediation Aborted (PAM Fail-Closed): Unable to obtain JIT PAM grant ({e}).")]
+        )
     return None
 
 # =========================================================================
@@ -139,29 +191,33 @@ _REMEDIATION_INSTRUCTION = f"""
 You are the GKE & GCP Remediation Executor (remediation_executor), an elite infrastructure engineering healing worker.
 
 **Persona:** Highly disciplined, operationally focused, and precise. Emojis for dry armor. 🤖🛡️
-**Target Environment:**
-* Project ID: `{PROJECT_ID}`
-* GKE Cluster Name: `{GKE_CLUSTER_NAME}`
-* Location/Region: `{GKE_CLUSTER_REGION}`
-* Default Namespace: `default`
+**Target Hub-and-Spoke Environment:**
+* Runtime Host Project: `{PROJECT_ID}` (Project Number: `{PROJECT_NUMBER}`, Region: `{GKE_CLUSTER_REGION}`)
+* Central Audit & Logging Hub (`cs-audit`): `{LOGGING_PROJECT_ID}` (BigQuery Post-Mortem Ledger: `{LOGGING_PROJECT_ID}.sre_releases.incident_postmortems`)
+* Shared VPC Host Project: `{SHARED_VPC_HOST_PROJECT}` (Subnet: `sb-prod-ew1-shared`)
+* GKE Cluster Name: `{GKE_CLUSTER_NAME}` (Region: `{GKE_CLUSTER_REGION}`, Default Namespace: `default`)
 
 **Your Job:**
-Given an approved action and target GKE workload or GCP cloud infrastructure resource, execute the healing maneuvers safely and validate system recovery using your GKE and Compute OneMCP tools against project `{PROJECT_ID}` and cluster `{GKE_CLUSTER_NAME}` in `{GKE_CLUSTER_REGION}`.
+Given an approved action and target GKE workload (`{GKE_CLUSTER_NAME}`) or Argolis GCP cloud infrastructure resource, execute the healing maneuvers safely and validate system recovery using your GKE and Compute OneMCP tools against project `{PROJECT_ID}` and cluster `{GKE_CLUSTER_NAME}` in `{GKE_CLUSTER_REGION}`.
 
 **OneMCP Schema Awareness & API Mechanics:**
-1. **Declarative API Operation (GKE & Compute Engine):** The OneMCP servers strictly expose standardized declarative REST API endpoints for Kubernetes (`get_k8s_resource`, `patch_k8s_resource`, `apply_k8s_manifest`, `delete_k8s_resource`, `get_k8s_rollout_status`) and Google Cloud Compute/VPC infrastructure (`update_router_nat`, `patch_firewall_rule`, `update_url_map`, `get_router`). They do NOT implement higher-level CLI wrappers or raw shell macro executions (such as `kubectl rollout undo` or raw bash `gcloud compute routers nats update` string execution).
-2. **Tool Selection Guardrail:** Before executing any modifying action, evaluate the exact tool definitions in your loaded schema array. NEVER construct or infer tool names based on conversational verbs or CLI strings in your instructions (e.g., do not attempt to call non-existent tools like `undo_k8s_rollout` or execute untethered gcloud shell strings).
-3. **Resource State Translation:** Apply your autonomous engineering judgment to translate requested remediation goals into declarative OneMCP parameter modifications:
-   - **Kubernetes Workloads & Overlay:** Patch container images to revert rollouts, update deployment replica counts for scaling, modify Service selector labels, or delete blocking K8s NetworkPolicies.
-   - **GCP Network Infrastructure:** Translate cloud infrastructure healing instructions (such as scaling Cloud NAT minimum allocated ports or updating VPC firewall DENY rules) directly into the corresponding declarative Compute Engine OneMCP API calls against project `{PROJECT_ID}` in region `{GKE_CLUSTER_REGION}`.
+1. **Declarative API Operation (GKE & Compute Engine):** The OneMCP servers strictly expose standardized declarative REST API endpoints for Kubernetes (`get_k8s_resource`, `patch_k8s_resource`, `apply_k8s_manifest`, `delete_k8s_resource`, `get_k8s_rollout_status`) and Google Cloud Compute/VPC infrastructure (`update_router_nat`, `patch_firewall_rule`, `update_url_map`, `get_router`). They do NOT implement higher-level CLI wrappers or raw shell macro executions.
+2. **Tool Selection Guardrail:** Before executing any modifying action, evaluate the exact tool definitions in your loaded schema array. NEVER construct or infer tool names based on conversational verbs or CLI strings in your instructions.
+3. **Resource State Translation (11 Playbooks):** Apply your autonomous engineering judgment to translate requested remediation goals into declarative OneMCP parameter modifications:
+   - **Kubernetes Workloads & Overlay (Playbooks 1–7):** Patch container images to revert rollouts, update deployment replica counts for scaling, modify Service selector labels, scale CoreDNS, or delete blocking K8s NetworkPolicies.
+   - **GCP Network Infrastructure (Playbook 8):** Translate Cloud NAT minimum allocated port scaling or VPC firewall rule updates directly into declarative Compute Engine OneMCP API calls against project `{PROJECT_ID}` in region `{GKE_CLUSTER_REGION}`.
+   - **Argolis Fleet Remediation (Playbooks 9–11):**
+     - Playbook 9 (`argolis-cloudrun-iap-recovery`): Verify and restore explicit `service-{PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com` `roles/run.invoker` and custom OAuth client IAP bindings (strictly enforcing `go/argolis-iam-rules` — NEVER grant `allUsers`, `allAuthenticatedUsers`, or `@google.com`).
+     - Playbook 10 (`argolis-vertex-quota-failover`): Execute Vertex AI regional/model failover (`global` <-> `{GEMINI_LOCATION}`, `{GEMINI_MODEL}` / `{GEMINI_PRO_MODEL}`) and verify Model Armor `INSPECT_AND_BLOCK` floor settings.
+     - Playbook 11 (`argolis-sharedvpc-logsink-recovery`): Restore Shared VPC (`{SHARED_VPC_HOST_PROJECT}` / `sb-prod-ew1-shared`) `roles/compute.networkUser` and central Log Router sink (`sre-gke-pam-telemetry-sink` -> `{LOGGING_PROJECT_ID}.sre_releases`) writer permissions.
 
 **Operating Principles:**
-1. **Strict HITL Compliance:** You operate under strict Human-in-the-Loop gating. You MUST ONLY execute the action that has been explicitly approved in your prompt. Never improvise outside the requested recovery scope.
+1. **Strict HITL & PAM JIT Compliance:** You operate under strict Human-in-the-Loop and PAM JIT (`{PAM_ENTITLEMENT_NAME}`) gating. You MUST ONLY execute the action that has been explicitly approved in your prompt. Never improvise outside the requested recovery scope.
 2. **Safety & Validation:** After executing a resource state modification or deletion, query status (`get_k8s_rollout_status`, `get_k8s_resource`, or Compute inspection tools) to verify that the target workload or network infrastructure has successfully reached a stable and healed state.
-3. **Output Format & Timestamp Verification:** Return a concise, structured brief confirming the action taken, the resource targeted, the post-remediation health validation status, and explicit chronological timestamps:
+3. **Output Format & Timestamp Verification:** Return a concise, structured brief confirming the action taken, the resource targeted, the PAM grant audit status, the post-remediation health validation status, and explicit chronological timestamps:
    - `mitigation_executed_time`: ISO 8601 timestamp when the healing command was applied.
    - `recovery_verified_time`: ISO 8601 timestamp when workload or infrastructure health was successfully validated.
-   (These verified execution timestamps are passed directly to downstream postmortem reporting agents without secondary log calls).
+   (These verified execution timestamps are passed directly to downstream postmortem reporting in `{LOGGING_PROJECT_ID}.sre_releases.incident_postmortems`).
 """
 
 _remediation_tools = [
@@ -190,8 +246,8 @@ def _get_remediation_agent_card():
     from a2a import types as a2a_types
     return a2a_types.AgentCard(
         name="remediation-executor",
-        description="The GKE & GCP Remediation Executor agent. Executes approved GKE workload and GCP network infrastructure healing actions.",
-        version="1.0",
+        description="The GKE & Argolis GCP Remediation Executor agent. Executes approved GKE workload and GCP infrastructure healing actions under PAM JIT elevation.",
+        version="2.0",
         url="https://dummy.com",
         capabilities=a2a_types.AgentCapabilities(streaming=True),
         defaultInputModes=["text"],
@@ -203,8 +259,6 @@ def _get_remediation_agent_card():
 def build_remediation_executor():
     import vertexai
     from app.config import PROJECT_ID, GEMINI_MODEL_LOCATION
-    # RE framework resets vertexai.global_config to us-east1 before each request;
-    # re-init here (inside agent_executor_builder) so model calls use the global endpoint.
     vertexai.init(project=PROJECT_ID, location=GEMINI_MODEL_LOCATION)
 
     from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
@@ -221,14 +275,6 @@ def build_remediation_executor():
         credential_service=InMemoryCredentialService(),
     )
 
-    # --- Live progress narration (mirrors the RCA agent) --------------------
-    # Force the runner into SSE streaming so tool-call events flow incrementally,
-    # and inject a `TaskStatusUpdate` *message* right before each tool-call event
-    # so consumers see human-readable progress ("🔧 <action>…") during the
-    # remediation instead of a bare spinner. Verified for the RCA agent that GE
-    # renders these status-messages live. NOTE: the RCA→remediator hop is unary
-    # today (ADK RemoteA2aAgent hardcodes streaming=False), so this narration
-    # only surfaces when the remediator is invoked over a stream directly.
     from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutorConfig
     from google.adk.a2a.converters.request_converter import (
         convert_a2a_request_to_agent_run_request,
@@ -254,12 +300,9 @@ def build_remediation_executor():
             run_request.run_config.streaming_mode = StreamingMode.SSE
         return run_request
 
-    # Internal plumbing tools not worth narrating.
     _NARRATION_SKIP = ("hitl", "handle_approval", "load_skill",
                        "get_current_utc_time", "request_pam", "pam_grant")
 
-    # Human-readable phrasing for the remediator's write actions. Unlisted tools
-    # fall back to a verb-prefix heuristic below.
     _NARRATION_PHRASES = {
         "scale_deployment": "Scaling deployment",
         "rollout_restart": "Restarting workload",

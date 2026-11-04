@@ -15,6 +15,13 @@
 variable "gcp_project_id" {
   description = "The Google Cloud Project ID where the SRE Agent Platform will be deployed."
   type        = string
+  default     = "antigravity-web-hub-argolis"
+}
+
+variable "logging_project_id" {
+  description = "The Central Audit & Logging Hub (cs-audit) Google Cloud Project ID for BigQuery and centralized Cloud Logging."
+  type        = string
+  default     = "argodev-prod-audit-logs-0"
 }
 
 variable "create_project" {
@@ -32,19 +39,19 @@ variable "billing_account_id" {
 variable "gcp_region" {
   description = "The target Google Cloud region for deploying resources and Vertex AI Reasoning Engines."
   type        = string
-  default     = "us-central1"
+  default     = "europe-west1"
 }
 
 variable "gcp_zone" {
   description = "The primary Google Cloud zone for GKE resources."
   type        = string
-  default     = "us-central1-a"
+  default     = "europe-west1-b"
 }
 
 variable "gemini_model" {
   description = "The Gemini model ID to use for the Investigator and Remediation agents."
   type        = string
-  default     = "gemini-3.7-flash"
+  default     = "gemini-2.5-flash"
 }
 
 variable "deploy_infrastructure" {
