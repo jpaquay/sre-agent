@@ -92,25 +92,25 @@ PROJECT_NUMBER = (
     or "723040006558"
 )
 
-DEFAULT_SERVICE_ACCOUNT = os.environ.get(
-    "REASONING_ENGINE_SERVICE_ACCOUNT",
-    f"{PROJECT_NUMBER}-compute@developer.gserviceaccount.com",
+INVESTIGATOR_SA = (
+    os.environ.get("INVESTIGATOR_SERVICE_ACCOUNT")
+    or os.environ.get("INVESTIGATOR_SA")
+    or f"sre-investigator-sa@{PROJECT_ID}.iam.gserviceaccount.com"
 )
-INVESTIGATOR_SA = os.environ.get(
-    "INVESTIGATOR_SA",
-    f"sre-investigator-sa@{PROJECT_ID}.iam.gserviceaccount.com",
+REMEDIATOR_SA = (
+    os.environ.get("REMEDIATOR_SERVICE_ACCOUNT")
+    or os.environ.get("REMEDIATOR_SA")
+    or f"sre-remediator-sa@{PROJECT_ID}.iam.gserviceaccount.com"
 )
-REMEDIATOR_SA = os.environ.get(
-    "REMEDIATOR_SA",
-    f"sre-remediator-sa@{PROJECT_ID}.iam.gserviceaccount.com",
+REPORTER_SA = (
+    os.environ.get("REPORTER_SERVICE_ACCOUNT")
+    or os.environ.get("REPORTER_SA")
+    or f"sre-reporter-sa@{PROJECT_ID}.iam.gserviceaccount.com"
 )
-REPORTER_SA = os.environ.get(
-    "REPORTER_SA",
-    f"sre-reporter-sa@{PROJECT_ID}.iam.gserviceaccount.com",
-)
-SIMULATOR_SA = os.environ.get(
-    "SIMULATOR_SA",
-    f"sre-simulator-sa@{PROJECT_ID}.iam.gserviceaccount.com",
+SIMULATOR_SA = (
+    os.environ.get("SIMULATOR_SERVICE_ACCOUNT")
+    or os.environ.get("SIMULATOR_SA")
+    or f"sre-simulator-sa@{PROJECT_ID}.iam.gserviceaccount.com"
 )
 
 PER_AGENT_SERVICE_ACCOUNTS = {
@@ -143,7 +143,12 @@ def deploy_agent(
     env_vars: dict = None,
     check_existing: bool = True,
 ):
-    target_sa = service_account or PER_AGENT_SERVICE_ACCOUNTS.get(display_name) or DEFAULT_SERVICE_ACCOUNT
+    target_sa = service_account or PER_AGENT_SERVICE_ACCOUNTS.get(display_name)
+    if not target_sa:
+        raise ValueError(
+            f"Refusing to deploy {display_name}: no dedicated service account configured "
+            "(fail-closed; default compute SA fallback disabled)."
+        )
     print(f"\n🚀 Deploying {display_name} with SA={target_sa}...")
     vertexai.init(project=PROJECT_ID, location=LOCATION, staging_bucket=STAGING_BUCKET)
 
@@ -162,7 +167,8 @@ def deploy_agent(
         "GKE_CLUSTER_REGION": GKE_CLUSTER_REGION,
         "GEMINI_MODEL": GEMINI_MODEL,
         "GEMINI_PRO_MODEL": GEMINI_PRO_MODEL,
-        "GEMINI_MODEL_LOCATION": "global",
+        "GEMINI_MODEL_LOCATION": LOCATION,
+        "GEMINI_FALLBACK_LOCATION": os.environ.get("GEMINI_FALLBACK_LOCATION", "europe-west4"),
         "TELEMETRY_BUCKET": STAGING_BUCKET,
         "PLAYBOOKS_BUCKET": PLAYBOOKS_BUCKET,
         "BQ_RECENT_RELEASES_TABLE": f"{LOGGING_PROJECT_ID}.sre_releases.recent_releases",
@@ -172,16 +178,13 @@ def deploy_agent(
         "MODEL_ARMOR_ENABLED": "true",
         "MODEL_ARMOR_FLOOR_SETTING": "INSPECT_AND_BLOCK",
         "GOOGLE_GENAI_USE_VERTEXAI": "1",
-        "GOOGLE_GENAI_LOCATION": "global",
+        "GOOGLE_GENAI_LOCATION": LOCATION,
         "GOOGLE_API_USE_CLIENT_CERTIFICATE": "false",
         "GOOGLE_API_USE_MTLS_ENDPOINT": "never",
         "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true",
         "OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED": "true",
         "OTEL_INSTRUMENTATION_A2A_SDK_ENABLED": "false",
-        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT",
-        "OTEL_INSTRUMENTATION_GENAI_UPLOAD_BASE_PATH": STAGING_BUCKET,
-        "OTEL_INSTRUMENTATION_GENAI_UPLOAD_FORMAT": "jsonl",
-        "OTEL_INSTRUMENTATION_GENAI_COMPLETION_HOOK": "upload",
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "NO_CONTENT",
         "OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental",
     }
     if env_vars:
@@ -244,33 +247,15 @@ def deploy_agent(
         "mcp>=1.20.0",
     ]
 
-    try:
-        remote_app = agent_engines.create(
-            agent_engine=app,
-            display_name=display_name,
-            gcs_dir_name=display_name,
-            requirements=requirements_list,
-            extra_packages=["./app"],
-            service_account=target_sa,
-            env_vars=merged_env_vars,
-        )
-    except Exception as sa_err:
-        if target_sa != DEFAULT_SERVICE_ACCOUNT:
-            print(
-                f"⚠️ Deployment with custom SA {target_sa} encountered error ({sa_err}). "
-                f"Falling back to {DEFAULT_SERVICE_ACCOUNT}..."
-            )
-            remote_app = agent_engines.create(
-                agent_engine=app,
-                display_name=display_name,
-                gcs_dir_name=display_name,
-                requirements=requirements_list,
-                extra_packages=["./app"],
-                service_account=DEFAULT_SERVICE_ACCOUNT,
-                env_vars=merged_env_vars,
-            )
-        else:
-            raise
+    remote_app = agent_engines.create(
+        agent_engine=app,
+        display_name=display_name,
+        gcs_dir_name=display_name,
+        requirements=requirements_list,
+        extra_packages=["./app"],
+        service_account=target_sa,
+        env_vars=merged_env_vars,
+    )
 
     print(f"✅ Deployment completed for {display_name}. Agent URN: {remote_app.resource_name}")
     return remote_app

@@ -419,9 +419,38 @@ def test_terraform_iam_waf_compliance():
             f"Missing dedicated service account {sa_id} in terraform/modules/iam/main.tf"
         )
 
-    # Must define the PAM gke-editor entitlement
+    # Must define the PAM gke-editor entitlement with deterministic manual approvals (Doc 1 W1)
     assert 'resource "google_privileged_access_manager_entitlement" "gke_editor"' in iam_tf
     assert 'entitlement_id = "gke-editor"' in iam_tf
+    assert "manual_approvals" in iam_tf
+    assert "group:gcp-security-admins@jpaquay.altostrat.com" in iam_tf
+    assert "compute@developer.gserviceaccount.com" not in iam_tf
+    # Standing cluster/network write roles must NOT sit permanently on worker SAs
+    assert '"roles/compute.networkAdmin"' not in iam_tf
+    remediator_block = iam_tf.split("remediator_runtime_roles")[1].split("reporter_runtime_roles")[0]
+    assert '"roles/container.developer"' not in remediator_block
+    simulator_block = iam_tf.split("simulator_runtime_roles")[1].split("telemetry_bucket")[0]
+    assert '"roles/container.developer"' not in simulator_block
+
+
+def test_doc1_hygiene_deploy_and_config_guards():
+    """Verify EU Benelux default location, GCS OneMCP path, no default compute SA fallback, and NO_CONTENT telemetry."""
+    import app.config as cfg
+
+    assert cfg.GCS_MCP_SERVER == "https://storage.googleapis.com/storage/mcp"
+    cfg_src = (SRE_AGENT_ROOT / "app" / "config.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("GEMINI_MODEL_LOCATION", "europe-west1")' in cfg_src
+    assert 'os.environ.get("GEMINI_FALLBACK_LOCATION", "europe-west4")' in cfg_src
+    assert 'os.environ["GEMINI_ACTIVE_LOCATION"]' not in cfg_src
+    assert "ContextVar" in cfg_src
+    deploy_src = (SRE_AGENT_ROOT / "deploy_a2a.py").read_text(encoding="utf-8")
+    assert '"NO_CONTENT"' in deploy_src
+    assert "SPAN_AND_EVENT" not in deploy_src
+    assert "compute@developer.gserviceaccount.com" not in deploy_src
+    assert "INVESTIGATOR_SERVICE_ACCOUNT" in deploy_src
+    assert "REMEDIATOR_SERVICE_ACCOUNT" in deploy_src
+    assert "REPORTER_SERVICE_ACCOUNT" in deploy_src
+    assert "SIMULATOR_SERVICE_ACCOUNT" in deploy_src
 
 
 def test_terraform_variables_and_bq_seed_waf_compliance():

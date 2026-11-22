@@ -71,8 +71,9 @@ locals {
   ])
 
   remediator_runtime_roles = toset([
-    "roles/container.developer",
-    "roles/compute.networkAdmin",
+    # Standing cluster/network write roles removed (Doc 1 W1); granted JIT via PAM gke-editor below.
+    "roles/container.viewer",
+    "roles/compute.viewer",
     "roles/mcp.toolUser",
     "roles/aiplatform.user",
     "roles/logging.logWriter",
@@ -92,7 +93,8 @@ locals {
   ])
 
   simulator_runtime_roles = toset([
-    "roles/container.developer",
+    # Standing roles/container.developer removed (Doc 1 W1); elevate via PAM when running chaos drills.
+    "roles/container.viewer",
     "roles/aiplatform.user",
     "roles/mcp.toolUser",
     "roles/logging.logWriter",
@@ -171,10 +173,23 @@ resource "google_privileged_access_manager_entitlement" "gke_editor" {
     unstructured {}
   }
 
+  approval_workflow {
+    manual_approvals {
+      require_approver_justification = true
+      steps {
+        approvals_needed = 1
+        approvers {
+          principals = [
+            "group:gcp-security-admins@jpaquay.altostrat.com",
+          ]
+        }
+      }
+    }
+  }
+
   eligible_users {
     principals = [
       "serviceAccount:${google_service_account.sre_remediator_sa.email}",
-      "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com",
     ]
   }
 

@@ -17,6 +17,7 @@ import re
 import json
 import uuid
 import logging
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import google.auth
 import google.auth.transport.requests
@@ -344,8 +345,10 @@ GEMINI_LOCATION = os.environ.get(
     "GOOGLE_CLOUD_LOCATION",
     os.environ.get("GOOGLE_CLOUD_REGION", "europe-west1")
 )
-# Separate location for model inference (global endpoint with regional fallback to europe-west1)
-GEMINI_MODEL_LOCATION = os.environ.get("GEMINI_MODEL_LOCATION", "global")
+# Primary location for model inference (EU Benelux primary with DR failover to europe-west4)
+GEMINI_MODEL_LOCATION = os.environ.get("GEMINI_MODEL_LOCATION", "europe-west1")
+GEMINI_FALLBACK_LOCATION = os.environ.get("GEMINI_FALLBACK_LOCATION", "europe-west4")
+_ACTIVE_GEMINI_LOCATION: ContextVar[str | None] = ContextVar("novasre_active_gemini_location", default=None)
 GKE_CLUSTER_NAME = os.environ.get("GKE_CLUSTER_NAME", "online-boutique")
 GKE_CLUSTER_REGION = os.environ.get("GKE_CLUSTER_REGION", "europe-west1")
 
@@ -384,69 +387,71 @@ PAM_GRANT_ACTIVE_TIMEOUT_SECONDS = int(os.environ.get("PAM_GRANT_ACTIVE_TIMEOUT_
 
 
 class GlobalGemini(Gemini):
-    """Gemini model routed to Vertex AI global publisher models with automatic regional failover to europe-west1."""
+    """Gemini model routed to Vertex AI EU Benelux primary (europe-west1) with coroutine-isolated regional failover (europe-west4)."""
 
     @property
     def api_client(self) -> Client:
-        active_location = os.environ.get("GEMINI_ACTIVE_LOCATION", GEMINI_MODEL_LOCATION)
+        active_location = _ACTIVE_GEMINI_LOCATION.get() or GEMINI_MODEL_LOCATION
         return Client(
             vertexai=True,
             location=active_location,
             project=PROJECT_ID,
             http_options=types.HttpOptions(
+                api_version="v1",
                 retry_options=types.HttpRetryOptions(
-                    attempts=5,
+                    attempts=2,
                     initial_delay=2.0,
-                    max_delay=60.0,
+                    max_delay=15.0,
                     exp_base=2.0,
-                    http_status_codes=[408, 429, 500, 502, 503, 504]
-                )
-            )
+                    http_status_codes=[408, 429, 500, 502, 503, 504],
+                ),
+            ),
         )
 
     def get_fallback_client(self, location: str = None) -> Client:
-        """Returns a regional Vertex AI Client (defaulting to europe-west1) for quota/endpoint failover."""
-        fallback_loc = location or GEMINI_LOCATION or "europe-west1"
+        """Returns a regional Vertex AI Client (defaulting to europe-west4 DR) for quota/endpoint failover."""
+        fallback_loc = location or GEMINI_FALLBACK_LOCATION or "europe-west4"
         return Client(
             vertexai=True,
             location=fallback_loc,
             project=PROJECT_ID,
             http_options=types.HttpOptions(
+                api_version="v1",
                 retry_options=types.HttpRetryOptions(
-                    attempts=3,
+                    attempts=2,
                     initial_delay=1.5,
-                    max_delay=30.0,
+                    max_delay=15.0,
                     exp_base=2.0,
-                    http_status_codes=[408, 429, 500, 502, 503, 504]
-                )
-            )
+                    http_status_codes=[408, 429, 500, 502, 503, 504],
+                ),
+            ),
         )
 
     async def generate_content_async(self, llm_request, stream: bool = False):
-        """Executes LLM inference on the primary endpoint (global) and automatically fails over to europe-west1 on 429/404/5xx."""
+        """Executes LLM inference in europe-west1 and fails over using a task-isolated ContextVar (no os.environ race)."""
         try:
             async for response in super().generate_content_async(llm_request, stream=stream):
                 yield response
         except Exception as primary_err:
             err_str = str(primary_err)
             if any(code in err_str for code in ("429", "404", "503", "RESOURCE_EXHAUSTED", "NOT_FOUND")):
-                fallback_loc = GEMINI_LOCATION if GEMINI_MODEL_LOCATION == "global" else "global"
+                fallback_loc = (
+                    GEMINI_FALLBACK_LOCATION
+                    if GEMINI_MODEL_LOCATION != GEMINI_FALLBACK_LOCATION
+                    else "europe-west1"
+                )
                 logger.warning(
                     "⚠️ [GlobalGemini] Primary inference failed in %s (%s). Failing over to %s with gemini-2.5-flash...",
-                    GEMINI_MODEL_LOCATION, err_str[:120], fallback_loc
+                    GEMINI_MODEL_LOCATION, err_str[:120], fallback_loc,
                 )
-                prev_loc = os.environ.get("GEMINI_ACTIVE_LOCATION")
-                os.environ["GEMINI_ACTIVE_LOCATION"] = fallback_loc
+                token = _ACTIVE_GEMINI_LOCATION.set(fallback_loc)
                 if hasattr(llm_request, "model") and llm_request.model == "gemini-3.7-flash":
                     llm_request.model = "gemini-2.5-flash"
                 try:
                     async for response in super().generate_content_async(llm_request, stream=stream):
                         yield response
                 finally:
-                    if prev_loc is None:
-                        os.environ.pop("GEMINI_ACTIVE_LOCATION", None)
-                    else:
-                        os.environ["GEMINI_ACTIVE_LOCATION"] = prev_loc
+                    _ACTIVE_GEMINI_LOCATION.reset(token)
             else:
                 raise
 
@@ -551,7 +556,7 @@ TRACE_MCP_SERVER = os.environ.get("TRACE_MCP_URL", "https://cloudtrace.googleapi
 ERROR_REPORTING_MCP_SERVER = os.environ.get("ERROR_REPORTING_MCP_URL", "https://clouderrorreporting.googleapis.com/mcp")
 GKE_MCP_SERVER = os.environ.get("GKE_MCP_URL", "https://container.googleapis.com/mcp")
 COMPUTE_MCP_SERVER = os.environ.get("COMPUTE_MCP_URL", "https://compute.googleapis.com/mcp")
-GCS_MCP_SERVER = os.environ.get("GCS_MCP_URL", "https://storage.googleapis.com/mcp")
+GCS_MCP_SERVER = os.environ.get("GCS_MCP_URL", "https://storage.googleapis.com/storage/mcp")
 BQ_MCP_SERVER = os.environ.get("BQ_MCP_URL", "https://bigquery.googleapis.com/mcp")
 
 _toolset_cache = {}
