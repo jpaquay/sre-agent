@@ -240,7 +240,7 @@ def deploy_agent(
         "google-cloud-storage>=2.18.0",
         "google-cloud-logging>=3.10.0",
         "google-cloud-privilegedaccessmanager>=0.4.1",
-        "a2ui-agent-sdk>=0.6.0",
+        "a2ui-agent-sdk==0.6.0",
         "requests>=2.31.0",
         "fastapi>=0.110.0",
         "uvicorn>=0.28.0",
